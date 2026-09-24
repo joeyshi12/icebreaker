@@ -40,7 +40,7 @@ states the config is in.
 | `TURN_SECRET` | none                           | the relay's shared secret, for minting        |
 | `TURN_URLS`   | none                           | comma separated, advertised to clients        |
 | `TURN_TTL`    | 1h                             | credential lifetime                           |
-| `ROOM_TTL`    | 15m                            | how long an unused room lives                 |
+| `ROOM_TTL`    | 15m                            | idle time before a room is dropped            |
 | `MAX_ROOMS`   | 500                            | across every app, because it guards memory    |
 | `MAX_JOINERS` | 3                              | joiners a room takes, for apps `APPS` omits   |
 | `APPS`        | none                           | optional: joiners per app, `arena:3,quiz:11`  |
@@ -48,6 +48,11 @@ states the config is in.
 A joiner count excludes the host, who holds seat 0 and never occupies one, so
 `arena:3` means four browsers in a room, as does the default of 3. `APPS` itself is
 optional: leave it unset and any app key is accepted at `MAX_JOINERS`.
+
+`ROOM_TTL` is idle time rather than total lifetime: every request for a room pushes
+its expiry back, so a session running longer than the TTL keeps its room while anyone
+is still polling, and an abandoned room is collected a TTL after the last request
+rather than a TTL after it opened.
 
 ## Endpoints
 

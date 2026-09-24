@@ -247,16 +247,22 @@ func ValidApp(app string) bool {
 	return true
 }
 
-// live returns an unexpired room, deleting it if it expired. Callers hold the mutex.
+// live returns an unexpired room, deleting it if it expired, and pushes the expiry
+// back. The TTL is idle time rather than total lifetime, so a session outliving it
+// keeps its room while anyone is still asking for it, and an abandoned room is
+// collected a TTL after the last request instead of a TTL after it opened. Callers
+// hold the mutex.
 func (s *Store) live(id ID) (*room, error) {
 	r, ok := s.rooms[id]
 	if !ok {
 		return nil, ErrNoRoom
 	}
-	if s.clock().After(r.expires) {
+	now := s.clock()
+	if now.After(r.expires) {
 		delete(s.rooms, id)
 		return nil, ErrNoRoom
 	}
+	r.expires = now.Add(s.ttl)
 	return r, nil
 }
 
