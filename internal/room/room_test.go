@@ -13,10 +13,10 @@ var (
 	answer = room.Description{Type: "answer", SDP: "v=0 answer"}
 )
 
-// open rooms in one unnamed namespace, which is what a client that sends no game
+// open rooms in one unnamed namespace, which is what a client that sends no app
 // key gets, and what most of these tests care about
 func openStore(ttl time.Duration, maxRooms, joiners int) *room.Store {
-	return room.NewStore(ttl, maxRooms, room.Games{Default: joiners})
+	return room.NewStore(ttl, maxRooms, room.Apps{Default: joiners})
 }
 
 func TestSeatsAreHandedOutInOrder(t *testing.T) {
@@ -96,41 +96,41 @@ func TestUnknownCodeIsAnError(t *testing.T) {
 	}
 }
 
-// The whole point of the game being half the key: a peer holding a real code for
-// the wrong game is told the same thing as a peer holding a made up code, and it
+// The whole point of the app being half the key: a peer holding a real code for
+// the wrong app is told the same thing as a peer holding a made up code, and it
 // cannot spend one of the room's seats on the way to finding out.
-func TestARoomIsUnreachableFromAnotherGame(t *testing.T) {
-	store := room.NewStore(time.Minute, 10, room.Games{Overrides: map[string]int{"arena": 3, "quiz": 11}})
+func TestARoomIsUnreachableFromAnotherApp(t *testing.T) {
+	store := room.NewStore(time.Minute, 10, room.Apps{Overrides: map[string]int{"arena": 3, "quiz": 11}})
 	arena, err := store.Open("arena")
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrong := room.ID{Game: "quiz", Code: arena.Code}
+	wrong := room.ID{App: "quiz", Code: arena.Code}
 
 	if _, err := store.Join(wrong, offer); err != room.ErrNoRoom {
-		t.Fatalf("joining across games: %v, want %v", err, room.ErrNoRoom)
+		t.Fatalf("joining across apps: %v, want %v", err, room.ErrNoRoom)
 	}
 	if _, err := store.TakeOffers(wrong); err != room.ErrNoRoom {
-		t.Fatalf("taking offers across games: %v", err)
+		t.Fatalf("taking offers across apps: %v", err)
 	}
 	if err := store.PutAnswer(wrong, 1, answer); err != room.ErrNoRoom {
-		t.Fatalf("answering across games: %v", err)
+		t.Fatalf("answering across apps: %v", err)
 	}
 	if _, _, err := store.TakeAnswer(wrong, 1); err != room.ErrNoRoom {
-		t.Fatalf("taking an answer across games: %v", err)
+		t.Fatalf("taking an answer across apps: %v", err)
 	}
 
 	store.Close(wrong)
 	if _, err := store.Join(arena, offer); err != nil {
-		t.Fatalf("the wrong game closed the real room: %v", err)
+		t.Fatalf("the wrong app closed the real room: %v", err)
 	}
 	if seat, err := store.Join(arena, offer); err != nil || seat != 2 {
-		t.Fatalf("seat %d err %v: the failed cross game joins should have cost nothing", seat, err)
+		t.Fatalf("seat %d err %v: the failed cross app joins should have cost nothing", seat, err)
 	}
 }
 
-func TestJoinerCapIsPerGame(t *testing.T) {
-	store := room.NewStore(time.Minute, 10, room.Games{
+func TestJoinerCapIsPerApp(t *testing.T) {
+	store := room.NewStore(time.Minute, 10, room.Apps{
 		Default:   3,
 		Overrides: map[string]int{"small": 1, "large": 5},
 	})
@@ -146,36 +146,36 @@ func TestJoinerCapIsPerGame(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := store.Join(small, offer); err != room.ErrFull {
-		t.Fatalf("a second joiner in a one seat game: %v", err)
+		t.Fatalf("a second joiner in a one seat app: %v", err)
 	}
 
 	large, _ := store.Open("large")
 	for i := 1; i <= 5; i++ {
 		if _, err := store.Join(large, offer); err != nil {
-			t.Fatalf("join %d of a five seat game: %v", i, err)
+			t.Fatalf("join %d of a five seat app: %v", i, err)
 		}
 	}
 	if _, err := store.Join(large, offer); err != room.ErrFull {
-		t.Fatalf("a sixth joiner in a five seat game: %v", err)
+		t.Fatalf("a sixth joiner in a five seat app: %v", err)
 	}
 }
 
-func TestAGameNobodyConfiguredCannotOpenARoom(t *testing.T) {
-	closed := room.NewStore(time.Minute, 10, room.Games{Default: 3, Overrides: map[string]int{"arena": 3}})
-	if _, err := closed.Open("typo"); err != room.ErrUnknownGame {
-		t.Fatalf("opening an unconfigured game: %v, want %v", err, room.ErrUnknownGame)
+func TestAnAppNobodyConfiguredCannotOpenARoom(t *testing.T) {
+	closed := room.NewStore(time.Minute, 10, room.Apps{Default: 3, Overrides: map[string]int{"arena": 3}})
+	if _, err := closed.Open("typo"); err != room.ErrUnknownApp {
+		t.Fatalf("opening an unconfigured app: %v, want %v", err, room.ErrUnknownApp)
 	}
-	if _, err := closed.Open(""); err != room.ErrUnknownGame {
-		t.Fatal("naming games should close the unnamed namespace too")
+	if _, err := closed.Open(""); err != room.ErrUnknownApp {
+		t.Fatal("naming apps should close the unnamed namespace too")
 	}
 	if _, err := closed.Open("arena"); err != nil {
-		t.Fatalf("a configured game: %v", err)
+		t.Fatalf("a configured app: %v", err)
 	}
 
-	open := room.NewStore(time.Minute, 10, room.Games{Default: 3})
-	for _, game := range []string{"", "arena", "anything-at-all"} {
-		if _, err := open.Open(game); err != nil {
-			t.Fatalf("with no games configured, %q should open: %v", game, err)
+	open := room.NewStore(time.Minute, 10, room.Apps{Default: 3})
+	for _, app := range []string{"", "arena", "anything-at-all"} {
+		if _, err := open.Open(app); err != nil {
+			t.Fatalf("with no apps configured, %q should open: %v", app, err)
 		}
 	}
 }
@@ -206,8 +206,8 @@ func TestRoomsExpireAndSweep(t *testing.T) {
 	}
 }
 
-func TestMaxRoomsCountsEveryGame(t *testing.T) {
-	store := room.NewStore(time.Minute, 2, room.Games{Overrides: map[string]int{"a": 1, "b": 1}})
+func TestMaxRoomsCountsEveryApp(t *testing.T) {
+	store := room.NewStore(time.Minute, 2, room.Apps{Overrides: map[string]int{"a": 1, "b": 1}})
 	if _, err := store.Open("a"); err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestMaxRoomsCountsEveryGame(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := store.Open("a"); err != room.ErrBusy {
-		t.Fatalf("the room limit protects this machine, not one game: %v", err)
+		t.Fatalf("the room limit protects this machine, not one app: %v", err)
 	}
 }
 
@@ -278,21 +278,21 @@ func TestNormalizeMatchesWhatPlayersType(t *testing.T) {
 	}
 }
 
-func TestGameKeysAreNormalizedAndBounded(t *testing.T) {
+func TestAppKeysAreNormalizedAndBounded(t *testing.T) {
 	for _, in := range []string{"ARENA", " arena ", "Arena\n"} {
-		if got := room.NormalizeGame(in); got != "arena" {
-			t.Fatalf("normalize game(%q) = %q", in, got)
+		if got := room.NormalizeApp(in); got != "arena" {
+			t.Fatalf("normalize app(%q) = %q", in, got)
 		}
 	}
 	for _, ok := range []string{"", "arena", "quiz-night", "a1"} {
-		if !room.ValidGame(ok) {
-			t.Fatalf("%q should be a usable game key", ok)
+		if !room.ValidApp(ok) {
+			t.Fatalf("%q should be a usable app key", ok)
 		}
 	}
-	// a game key becomes a map key, so it stays short and boring
+	// a app key becomes a map key, so it stays short and boring
 	for _, bad := range []string{"ARENA", "arena two", "arena/../x", "a@b", "qüiz", strings.Repeat("a", 33)} {
-		if room.ValidGame(bad) {
-			t.Fatalf("%q should not be a usable game key", bad)
+		if room.ValidApp(bad) {
+			t.Fatalf("%q should not be a usable app key", bad)
 		}
 	}
 }

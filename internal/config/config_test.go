@@ -19,61 +19,61 @@ func TestDefaultsAreSignallingOnly(t *testing.T) {
 	if cfg.TURNReady() {
 		t.Fatal("no relay should be advertised without a secret and a url")
 	}
-	if cfg.Games.Default != 3 {
-		t.Fatalf("max joiners %d, which is four peers per room", cfg.Games.Default)
+	if cfg.Apps.Default != 3 {
+		t.Fatalf("max joiners %d, which is four peers per room", cfg.Apps.Default)
 	}
-	if cfg.Games.Overrides != nil {
-		t.Fatalf("games %v: unset GAMES leaves the set of game keys open", cfg.Games.Overrides)
+	if cfg.Apps.Overrides != nil {
+		t.Fatalf("apps %v: unset APPS leaves the set of app keys open", cfg.Apps.Overrides)
 	}
 }
 
-func TestGamesClosesTheSetAndCapsEachOne(t *testing.T) {
-	t.Setenv("GAMES", "arena:3, quiz-night:11 ,")
+func TestAppsClosesTheSetAndCapsEachOne(t *testing.T) {
+	t.Setenv("APPS", "arena:3, quiz-night:11 ,")
 	cfg := config.Load()
-	if got := cfg.Games.MaxJoiners("arena"); got != 3 {
+	if got := cfg.Apps.MaxJoiners("arena"); got != 3 {
 		t.Fatalf("arena cap %d", got)
 	}
-	if got := cfg.Games.MaxJoiners("quiz-night"); got != 11 {
+	if got := cfg.Apps.MaxJoiners("quiz-night"); got != 11 {
 		t.Fatalf("quiz-night cap %d", got)
 	}
-	if !cfg.Games.Allows("arena") || !cfg.Games.Allows("quiz-night") {
-		t.Fatal("both configured games should be allowed")
+	if !cfg.Apps.Allows("arena") || !cfg.Apps.Allows("quiz-night") {
+		t.Fatal("both configured apps should be allowed")
 	}
 	for _, other := range []string{"", "typo", "arena3"} {
-		if cfg.Games.Allows(other) {
-			t.Fatalf("naming games should close the set, but %q was allowed", other)
+		if cfg.Apps.Allows(other) {
+			t.Fatalf("naming apps should close the set, but %q was allowed", other)
 		}
 	}
 }
 
-func TestGamesEntriesAreNormalizedAndBadOnesDropped(t *testing.T) {
-	t.Setenv("GAMES", " ARENA : 3 ")
-	if got := config.Load().Games.MaxJoiners("arena"); got != 3 {
+func TestAppsEntriesAreNormalizedAndBadOnesDropped(t *testing.T) {
+	t.Setenv("APPS", " ARENA : 3 ")
+	if got := config.Load().Apps.MaxJoiners("arena"); got != 3 {
 		t.Fatalf("arena cap %d: a key should be normalized the way a request is", got)
 	}
 
-	// a dropped entry becomes a game nobody can open, which is louder than a
+	// a dropped entry becomes an app nobody can open, which is louder than a
 	// silently wrong room size
 	for _, bad := range []string{"arena", "arena:", "arena:none", "arena:0", "arena:-1", ":3", "arena two:3"} {
-		t.Setenv("GAMES", bad)
+		t.Setenv("APPS", bad)
 		cfg := config.Load()
-		if cfg.Games.Overrides != nil {
-			t.Fatalf("GAMES=%q parsed to %v, want nothing usable", bad, cfg.Games.Overrides)
+		if cfg.Apps.Overrides != nil {
+			t.Fatalf("APPS=%q parsed to %v, want nothing usable", bad, cfg.Apps.Overrides)
 		}
 	}
 }
 
 func TestOneBadEntryDoesNotTakeTheGoodOnesWithIt(t *testing.T) {
-	t.Setenv("GAMES", "arena:3, broken, quiz:11")
+	t.Setenv("APPS", "arena:3, broken, quiz:11")
 	cfg := config.Load()
-	if got := cfg.Games.MaxJoiners("arena"); got != 3 {
+	if got := cfg.Apps.MaxJoiners("arena"); got != 3 {
 		t.Fatalf("arena cap %d", got)
 	}
-	if got := cfg.Games.MaxJoiners("quiz"); got != 11 {
+	if got := cfg.Apps.MaxJoiners("quiz"); got != 11 {
 		t.Fatalf("quiz cap %d", got)
 	}
-	if cfg.Games.Allows("broken") {
-		t.Fatal("an entry with no cap should not become a game")
+	if cfg.Apps.Allows("broken") {
+		t.Fatal("an entry with no cap should not become an app")
 	}
 }
 

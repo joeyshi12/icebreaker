@@ -1,20 +1,20 @@
 # icebreaker
 
-A WebRTC rendezvous for peer to peer browser games: room codes, the SDP handover
+A WebRTC rendezvous for peer to peer browser apps: room codes, the SDP handover
 between a host and its joiners, and the ICE servers they need. One static binary,
-standard library only.
+standard library only. Games are the obvious use, but nothing here assumes one.
 
 The name is the job. It hands out ICE servers, and it introduces peers who have
 never met so they can talk among themselves.
 
-A game using this puts one peer at the centre of a star: joiners connect to the host
+An app using this puts one peer at the centre of a star: joiners connect to the host
 and to nobody else. This service holds a room code, passes the blobs, and gets out
-of the way. It sees no game state, keeps nothing once a room closes, and is never in
-the data path.
+of the way. It sees no application state, keeps nothing once a room closes, and is
+never in the data path.
 
 ```
 cmd/icebreaker/    the binary: config, wiring, graceful shutdown
-internal/api/      the http endpoints the games talk to
+internal/api/      the http endpoints the apps talk to
 internal/room/     rooms, seats, codes, expiry
 internal/creds/    ephemeral TURN credentials for a relay elsewhere
 internal/config/   settings from the environment
@@ -41,9 +41,9 @@ states the config is in.
 | `TURN_URLS`   | none                           | comma separated, advertised to clients        |
 | `TURN_TTL`    | 1h                             | credential lifetime                           |
 | `ROOM_TTL`    | 15m                            | how long an unused room lives                 |
-| `MAX_ROOMS`   | 500                            | across every game, because it guards memory   |
-| `MAX_JOINERS` | 3                              | joiners per room, for games `GAMES` omits     |
-| `GAMES`       | none                           | `arena:3,quiz:11`, which also closes the set   |
+| `MAX_ROOMS`   | 500                            | across every app, because it guards memory    |
+| `MAX_JOINERS` | 3                              | joiners per room, for apps `APPS` omits       |
+| `APPS`        | none                           | `arena:3,quiz:11`, which also closes the set  |
 
 ## Endpoints
 
@@ -55,11 +55,11 @@ states the config is in.
 | `GET /offers/{code}`        | host collects new offers, each handed over once            |
 | `POST /answer`              | host leaves its answer for a seat                          |
 | `GET /answer/{code}/{seat}` | joiner collects its answer                                 |
-| `POST /close`               | host drops the room once the match starts                  |
+| `POST /close`               | host drops the room once everyone is connected             |
 | `GET /health`               | `{ok, rooms, version}`                                    |
 
 Seat 0 is the host; joiners are numbered from 1 in arrival order, and what a seat
-entitles a peer to is the game's business. Both reads are destructive: an offer is
+entitles a peer to is the app's business. Both reads are destructive: an offer is
 handed over once and an answer is deleted when collected, so a client that loses a
 response cannot ask again.
 
@@ -67,24 +67,23 @@ The joiner offers and the host answers, rather than the other way round. An offe
 belongs to one peer connection, so a host cannot publish one offer for three
 joiners, and this way the room code exists before the host has gathered candidates.
 
-## Games
+## Apps
 
-A room is identified by a game and a code together, so several games can share a
-deployment. A peer holding a live code for the wrong game is told
+A room is identified by an app and a code together, so several apps can share a
+deployment. A peer holding a live code for the wrong app is told
 `404 no room with that code`, the same thing a made up code gets. Without that the
-join would succeed, the offer would land in the other game's mailbox, and the
-mismatch would surface only when the first game message proved unreadable, by which
-point the room has spent a seat it never gets back.
+join would succeed, the offer would land in the other app's mailbox, and the mismatch
+would surface only when the first message proved unreadable, by which point the room
+has spent a seat it never gets back.
 
-Every endpoint except `/ice` and `/health` takes the game as `?game=`. A key is
+Every endpoint except `/ice` and `/health` takes the app as `?app=`. A key is
 lowercased and trimmed, may hold only `a-z`, `0-9` and `-`, and is at most 32
-characters; anything else is a `400`. Sending no key is legal and lands in an
-unnamed namespace, which is what lets a client written before games existed keep
-working.
+characters; anything else is a `400`. Sending no key is legal and lands in an unnamed
+namespace, which is what lets a client written before app keys existed keep working.
 
-`GAMES` sets each game's joiner cap and closes the set of keys, so a typo becomes an
+`APPS` sets each app's joiner cap and closes the set of keys, so a typo becomes an
 error rather than a namespace of its own. Mind the ordering: closing the set leaves
-the unnamed namespace unconfigured, so name the games only once the clients are
+the unnamed namespace unconfigured, so name the apps only once the clients are
 sending keys.
 
 This is namespacing, not authentication. A modified client can claim any key it

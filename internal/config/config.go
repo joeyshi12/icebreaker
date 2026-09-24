@@ -23,8 +23,8 @@ type Config struct {
 	RoomTTL  time.Duration
 	MaxRooms int
 
-	// Games caps joiners per game. A nil Overrides accepts any game key.
-	Games room.Games
+	// Apps caps joiners per app. A nil Overrides accepts any app key.
+	Apps room.Apps
 }
 
 func Load() Config {
@@ -37,9 +37,9 @@ func Load() Config {
 		TURNTTL:    envDuration("TURN_TTL", time.Hour),
 		RoomTTL:    envDuration("ROOM_TTL", 15*time.Minute),
 		MaxRooms:   envInt("MAX_ROOMS", 500),
-		Games: room.Games{
+		Apps: room.Apps{
 			Default:   envInt("MAX_JOINERS", 3),
-			Overrides: envGames("GAMES"),
+			Overrides: envApps("APPS"),
 		},
 	}
 }
@@ -69,20 +69,20 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	return fallback
 }
 
-// envGames parses "arena:3, quiz:11" into per game joiner caps. Nil means the
-// variable was unset or unusable, which leaves the set of games open. An entry
-// with no usable number is dropped rather than defaulted, so a typo shows up as
-// a game nobody can open rather than as a silently wrong room size.
-func envGames(key string) map[string]int {
+// envApps parses "arena:3, quiz:11" into per app joiner caps. Nil means the
+// variable was unset or unusable, which leaves the set of apps open. An entry with
+// no usable number is dropped rather than defaulted, so a typo shows up as an app
+// nobody can open rather than as a silently wrong room size.
+func envApps(key string) map[string]int {
 	out := map[string]int{}
 	for _, part := range envList(key, nil) {
 		name, joiners, ok := strings.Cut(part, ":")
 		if !ok {
 			continue
 		}
-		name = room.NormalizeGame(name)
+		name = room.NormalizeApp(name)
 		n, err := strconv.Atoi(strings.TrimSpace(joiners))
-		if name == "" || !room.ValidGame(name) || err != nil || n < 1 {
+		if name == "" || !room.ValidApp(name) || err != nil || n < 1 {
 			continue
 		}
 		out[name] = n

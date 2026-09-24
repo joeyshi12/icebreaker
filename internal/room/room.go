@@ -14,47 +14,47 @@ const (
 	alphabet   = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 	codeLength = 4
 	maxSDP     = 32000
-	maxGame    = 32
+	maxApp     = 32
 )
 
 var (
-	ErrNoRoom      = errors.New("no room with that code")
-	ErrFull        = errors.New("that room is full")
-	ErrNoSeat      = errors.New("no such seat")
-	ErrBusy        = errors.New("could not allocate a code")
-	ErrUnknownGame = errors.New("no such game")
+	ErrNoRoom     = errors.New("no room with that code")
+	ErrFull       = errors.New("that room is full")
+	ErrNoSeat     = errors.New("no such seat")
+	ErrBusy       = errors.New("could not allocate a code")
+	ErrUnknownApp = errors.New("no such app")
 )
 
-// ID identifies a room. The game is half of the key, so a code belonging to one
-// game can never reach another's room: the lookup misses, and the caller is told
-// there is no room with that code, which is all a peer in the wrong game needs to
-// hear. Codes are unique within a game rather than across all of them.
+// ID identifies a room. The app is half of the key, so a code belonging to one app
+// can never reach another's room: the lookup misses, and the caller is told there is
+// no room with that code, which is all a peer in the wrong app needs to hear. Codes
+// are unique within an app rather than across all of them.
 type ID struct {
-	Game string
+	App  string
 	Code string
 }
 
-// Games is how many joiners each game allows. A nil Overrides accepts any game
-// key at the default; a non-nil one closes the set to the keys it names, so a
+// Apps is how many joiners each app allows. A nil Overrides accepts any app key
+// at the default; a non-nil one closes the set to the keys it names, so a
 // client that sends a key nobody configured cannot open a namespace by typo.
-type Games struct {
+type Apps struct {
 	Default   int
 	Overrides map[string]int
 }
 
-func (g Games) Allows(game string) bool {
-	if g.Overrides == nil {
+func (a Apps) Allows(app string) bool {
+	if a.Overrides == nil {
 		return true
 	}
-	_, ok := g.Overrides[game]
+	_, ok := a.Overrides[app]
 	return ok
 }
 
-func (g Games) MaxJoiners(game string) int {
-	if n, ok := g.Overrides[game]; ok {
+func (a Apps) MaxJoiners(app string) int {
+	if n, ok := a.Overrides[app]; ok {
 		return n
 	}
-	return g.Default
+	return a.Default
 }
 
 type Description struct {
@@ -89,23 +89,23 @@ type Store struct {
 	rooms    map[ID]*room
 	ttl      time.Duration
 	maxRooms int
-	games    Games
+	apps     Apps
 
 	// Now is the clock, so tests can move time. Nil means time.Now.
 	Now func() time.Time
 }
 
-func NewStore(ttl time.Duration, maxRooms int, games Games) *Store {
+func NewStore(ttl time.Duration, maxRooms int, apps Apps) *Store {
 	return &Store{
 		rooms:    map[ID]*room{},
 		ttl:      ttl,
 		maxRooms: maxRooms,
-		games:    games,
+		apps:     apps,
 	}
 }
 
-func (s *Store) MaxJoiners(game string) int { return s.games.MaxJoiners(game) }
-func (s *Store) TTL() time.Duration         { return s.ttl }
+func (s *Store) MaxJoiners(app string) int { return s.apps.MaxJoiners(app) }
+func (s *Store) TTL() time.Duration        { return s.ttl }
 
 func (s *Store) Len() int {
 	s.mu.Lock()
@@ -113,18 +113,18 @@ func (s *Store) Len() int {
 	return len(s.rooms)
 }
 
-// Open reserves a code for a game. MAX_ROOMS is a limit on the whole process, not
-// on one game, because what it protects is this machine's memory.
-func (s *Store) Open(game string) (ID, error) {
-	if !s.games.Allows(game) {
-		return ID{}, ErrUnknownGame
+// Open reserves a code for an app. MAX_ROOMS is a limit on the whole process, not
+// on one app, because what it protects is this machine's memory.
+func (s *Store) Open(app string) (ID, error) {
+	if !s.apps.Allows(app) {
+		return ID{}, ErrUnknownApp
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.rooms) >= s.maxRooms {
 		return ID{}, ErrBusy
 	}
-	id, err := s.freeCode(game)
+	id, err := s.freeCode(app)
 	if err != nil {
 		return ID{}, err
 	}
@@ -140,7 +140,7 @@ func (s *Store) Join(id ID, offer Description) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if r.seats >= s.games.MaxJoiners(id.Game) {
+	if r.seats >= s.apps.MaxJoiners(id.App) {
 		return 0, ErrFull
 	}
 	r.seats++
@@ -224,20 +224,20 @@ func Normalize(code string) string {
 	return strings.ToUpper(strings.TrimSpace(code))
 }
 
-// NormalizeGame puts a game key in the form rooms are keyed by. Unlike a code it
+// NormalizeApp puts an app key in the form rooms are keyed by. Unlike a code it
 // is not read out loud, so it is lowercased rather than uppercased.
-func NormalizeGame(game string) string {
-	return strings.ToLower(strings.TrimSpace(game))
+func NormalizeApp(app string) string {
+	return strings.ToLower(strings.TrimSpace(app))
 }
 
-// ValidGame reports whether a game key is one this service will use as a map key
+// ValidApp reports whether an app key is one this service will use as a map key
 // at all, before any question of whether it is configured. Empty is valid: it is
 // the namespace of a client that sends no key.
-func ValidGame(game string) bool {
-	if len(game) > maxGame {
+func ValidApp(app string) bool {
+	if len(app) > maxApp {
 		return false
 	}
-	for _, ch := range game {
+	for _, ch := range app {
 		switch {
 		case ch >= 'a' && ch <= 'z', ch >= '0' && ch <= '9', ch == '-':
 		default:
@@ -260,7 +260,7 @@ func (s *Store) live(id ID) (*room, error) {
 	return r, nil
 }
 
-func (s *Store) freeCode(game string) (ID, error) {
+func (s *Store) freeCode(app string) (ID, error) {
 	buf := make([]byte, codeLength)
 	for attempt := 0; attempt < 200; attempt++ {
 		if _, err := rand.Read(buf); err != nil {
@@ -270,7 +270,7 @@ func (s *Store) freeCode(game string) (ID, error) {
 		for i, b := range buf {
 			code[i] = alphabet[int(b)%len(alphabet)]
 		}
-		id := ID{Game: game, Code: string(code)}
+		id := ID{App: app, Code: string(code)}
 		if _, taken := s.rooms[id]; !taken {
 			return id, nil
 		}
