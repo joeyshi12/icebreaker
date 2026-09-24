@@ -1,4 +1,4 @@
-// Icebreaker: a WebRTC signalling server for peer to peer apps, and the ICE servers to use.
+// Icebreaker: a WebRTC rendezvous server for peer to peer apps, and the ICE servers to use.
 package main
 
 import (
@@ -73,7 +73,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 
 	failed := make(chan error, 1)
 	go func() {
-		log.Info("signalling listening", "port", cfg.Port)
+		log.Info("rendezvous listening", "port", cfg.Port)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			failed <- err
 		}

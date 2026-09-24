@@ -1,6 +1,6 @@
 # icebreaker
 
-A WebRTC signalling server for peer to peer browser apps: room codes, the SDP
+A WebRTC rendezvous server for peer to peer browser apps: room codes, the SDP
 handover between a host and its joiners, and the ICE servers they need. One static
 binary, standard library only.
 
