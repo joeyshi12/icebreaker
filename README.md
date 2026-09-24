@@ -77,8 +77,14 @@ deployment and a peer holding a live code for the wrong app gets the same
 `404 no room with that code` as a made up one. Without that the join would succeed
 and the room would spend a seat on a peer that can never use it.
 
-`APPS` sets each app's joiner cap and closes the set of keys. Closing it leaves the
-unnamed namespace unconfigured, so set `APPS` only once clients send keys.
+`APPS` sets each app's joiner cap. Any key is still accepted, and one nobody named
+gets `MAX_JOINERS`, so an app can be given a bigger lobby without stranding a client
+that predates app keys. An entry `APPS` cannot parse is reported at startup, because
+it silently leaves that app on the default otherwise.
+
+There is no allowlist, deliberately. An unrecognised key only ever means a room
+nobody else can find, which the host learns the moment a friend reads the code back,
+and `MAX_ROOMS` bounds the memory whatever keys exist.
 
 Namespacing, not authentication: a modified client can claim any key.
 

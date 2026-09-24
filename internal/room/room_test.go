@@ -160,22 +160,25 @@ func TestJoinerCapIsPerApp(t *testing.T) {
 	}
 }
 
-func TestAnAppNobodyConfiguredCannotOpenARoom(t *testing.T) {
-	closed := room.NewStore(time.Minute, 10, room.Apps{Default: 3, Overrides: map[string]int{"arena": 3}})
-	if _, err := closed.Open("typo"); err != room.ErrUnknownApp {
-		t.Fatalf("opening an unconfigured app: %v, want %v", err, room.ErrUnknownApp)
+// Any app key opens a room. Naming some in APPS gives those their own cap and leaves
+// everything else on the default, which is what lets a client that predates app keys
+// keep working alongside one that uses them.
+func TestAnyAppKeyOpensARoomAndNamedOnesGetTheirCap(t *testing.T) {
+	store := room.NewStore(time.Minute, 20, room.Apps{
+		Default:   3,
+		Overrides: map[string]int{"arena": 11},
+	})
+	for _, app := range []string{"", "arena", "typo", "anything-at-all"} {
+		if _, err := store.Open(app); err != nil {
+			t.Fatalf("opening %q: %v", app, err)
+		}
 	}
-	if _, err := closed.Open(""); err != room.ErrUnknownApp {
-		t.Fatal("naming apps should close the unnamed namespace too")
+	if got := store.MaxJoiners("arena"); got != 11 {
+		t.Fatalf("a named app should get its own cap, got %d", got)
 	}
-	if _, err := closed.Open("arena"); err != nil {
-		t.Fatalf("a configured app: %v", err)
-	}
-
-	open := room.NewStore(time.Minute, 10, room.Apps{Default: 3})
-	for _, app := range []string{"", "arena", "anything-at-all"} {
-		if _, err := open.Open(app); err != nil {
-			t.Fatalf("with no apps configured, %q should open: %v", app, err)
+	for _, other := range []string{"", "typo"} {
+		if got := store.MaxJoiners(other); got != 3 {
+			t.Fatalf("%q should fall back to the default, got %d", other, got)
 		}
 	}
 }

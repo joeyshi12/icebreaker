@@ -23,12 +23,17 @@ type Config struct {
 	RoomTTL  time.Duration
 	MaxRooms int
 
-	// Apps caps joiners per app. A nil Overrides accepts any app key.
+	// Apps caps joiners per app. Any app key is accepted; named ones get their
+	// own cap.
 	Apps room.Apps
+
+	// RejectedApps holds APPS entries that could not be parsed. Dropping one means
+	// that app silently falls back to MAX_JOINERS, so startup says so.
+	RejectedApps []string
 }
 
 func Load() Config {
-	return Config{
+	cfg := Config{
 		Port:       envInt("PORT", 8001),
 		Origins:    envList("ORIGINS", nil),
 		STUN:       envList("STUN_URLS", []string{"stun:stun.l.google.com:19302"}),
@@ -38,10 +43,11 @@ func Load() Config {
 		RoomTTL:    envDuration("ROOM_TTL", 15*time.Minute),
 		MaxRooms:   envInt("MAX_ROOMS", 500),
 		Apps: room.Apps{
-			Default:   envInt("MAX_JOINERS", 3),
-			Overrides: envApps("APPS"),
+			Default: envInt("MAX_JOINERS", 3),
 		},
 	}
+	cfg.Apps.Overrides, cfg.RejectedApps = envApps("APPS")
+	return cfg
 }
 
 // TURNReady reports whether clients will be handed relay credentials. Both halves
@@ -69,28 +75,27 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	return fallback
 }
 
-// envApps parses "arena:3, quiz:11" into per app joiner caps. Nil means the
-// variable was unset or unusable, which leaves the set of apps open. An entry with
-// no usable number is dropped rather than defaulted, so a typo shows up as an app
-// nobody can open rather than as a silently wrong room size.
-func envApps(key string) map[string]int {
+// envApps parses "arena:3, quiz:11" into per app joiner caps, and returns whatever
+// it could not make sense of alongside. A rejected entry is not an error, since that
+// app still works at MAX_JOINERS, but it is a silently wrong room size unless
+// somebody says something, so the caller is handed the list to complain about.
+func envApps(key string) (map[string]int, []string) {
 	out := map[string]int{}
+	var rejected []string
 	for _, part := range envList(key, nil) {
 		name, joiners, ok := strings.Cut(part, ":")
-		if !ok {
-			continue
-		}
-		name = room.NormalizeApp(name)
 		n, err := strconv.Atoi(strings.TrimSpace(joiners))
-		if name == "" || !room.ValidApp(name) || err != nil || n < 1 {
+		name = room.NormalizeApp(name)
+		if !ok || name == "" || !room.ValidApp(name) || err != nil || n < 1 {
+			rejected = append(rejected, part)
 			continue
 		}
 		out[name] = n
 	}
 	if len(out) == 0 {
-		return nil
+		return nil, rejected
 	}
-	return out
+	return out, rejected
 }
 
 func envList(key string, fallback []string) []string {
