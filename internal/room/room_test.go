@@ -180,6 +180,68 @@ func TestAnAppNobodyConfiguredCannotOpenARoom(t *testing.T) {
 	}
 }
 
+// The TTL is idle time, not total lifetime. A session longer than the TTL keeps its
+// room while anyone is still polling it, which is what lets a match outlive the
+// default without losing the ability to let a dropped peer back in.
+func TestUseKeepsARoomAlive(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	store := openStore(time.Minute, 10, 3)
+	store.Now = func() time.Time { return now }
+
+	id, _ := store.Open("")
+	// eight half-TTL steps, so four times the TTL in total, touched at every one
+	for step := 1; step <= 8; step++ {
+		now = now.Add(30 * time.Second)
+		if _, err := store.TakeOffers(id); err != nil {
+			t.Fatalf("step %d, after %v of continuous use: %v", step, time.Duration(step)*30*time.Second, err)
+		}
+	}
+
+	// and it is still collected once nobody asks for it
+	now = now.Add(2 * time.Minute)
+	if _, err := store.TakeOffers(id); err != room.ErrNoRoom {
+		t.Fatalf("an idle room should still expire, got %v", err)
+	}
+}
+
+// Every operation that reaches a room counts as use, so the expiry does not depend
+// on which one a client happens to be polling.
+func TestEveryOperationPushesTheExpiryBack(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(*room.Store, room.ID)
+		touch func(*room.Store, room.ID)
+	}{
+		{"join", func(*room.Store, room.ID) {}, func(s *room.Store, id room.ID) { s.Join(id, offer) }},
+		{"take offers", func(*room.Store, room.ID) {}, func(s *room.Store, id room.ID) { s.TakeOffers(id) }},
+		{
+			"put answer",
+			func(s *room.Store, id room.ID) { s.Join(id, offer) },
+			func(s *room.Store, id room.ID) { s.PutAnswer(id, 1, answer) },
+		},
+		{
+			"take answer",
+			func(s *room.Store, id room.ID) { s.Join(id, offer); s.PutAnswer(id, 1, answer) },
+			func(s *room.Store, id room.ID) { s.TakeAnswer(id, 1) },
+		},
+	}
+	for _, c := range cases {
+		now := time.Unix(1_000_000, 0)
+		store := openStore(time.Minute, 10, 3)
+		store.Now = func() time.Time { return now }
+		id, _ := store.Open("")
+		c.setup(store, id)
+
+		now = now.Add(45 * time.Second) // inside the original minute
+		c.touch(store, id)
+		now = now.Add(45 * time.Second) // past it, but only 45s since the touch
+
+		if _, err := store.TakeOffers(id); err == room.ErrNoRoom {
+			t.Fatalf("%s did not push the expiry back", c.name)
+		}
+	}
+}
+
 func TestRoomsExpireAndSweep(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	store := openStore(time.Minute, 10, 3)
