@@ -1,16 +1,13 @@
 # icebreaker
 
-A WebRTC rendezvous for peer to peer browser apps: room codes, the SDP handover
-between a host and its joiners, and the ICE servers they need. One static binary,
-standard library only. Games are the obvious use, but nothing here assumes one.
-
-The name is the job. It hands out ICE servers, and it introduces peers who have
-never met so they can talk among themselves.
+A WebRTC signalling server for peer to peer browser apps: room codes, the SDP
+handover between a host and its joiners, and the ICE servers they need. One static
+binary, standard library only.
 
 An app using this puts one peer at the centre of a star: joiners connect to the host
-and to nobody else. This service holds a room code, passes the blobs, and gets out
-of the way. It sees no application state, keeps nothing once a room closes, and is
-never in the data path.
+and to nobody else. This server holds a room code and passes the blobs. It keeps no
+application state, drops everything when a room closes, and is never in the data
+path.
 
 ```
 cmd/icebreaker/    the binary: config, wiring, graceful shutdown
@@ -24,13 +21,9 @@ internal/config/   settings from the environment
 
 ```bash
 make build && ./icebreaker   # or: make run
-make test                    # 41 cases
+make test                    # 43 cases
 make race
 ```
-
-STUN only is the default. Handing out relay credentials needs both a secret shared
-with the relay and addresses to advertise, and startup reports which of the four
-states the config is in.
 
 | Variable      | Default                        | Meaning                                       |
 | ------------- | ------------------------------ | --------------------------------------------- |
@@ -45,14 +38,12 @@ states the config is in.
 | `MAX_JOINERS` | 3                              | joiners a room takes, for apps `APPS` omits   |
 | `APPS`        | none                           | optional: joiners per app, `arena:3,quiz:11`  |
 
-A joiner count excludes the host, who holds seat 0 and never occupies one, so
-`arena:3` means four browsers in a room, as does the default of 3. `APPS` itself is
-optional: leave it unset and any app key is accepted at `MAX_JOINERS`.
+STUN only is the default. Relay credentials need both `TURN_SECRET` and `TURN_URLS`,
+and startup reports which of the four combinations is in effect.
 
-`ROOM_TTL` is idle time rather than total lifetime: every request for a room pushes
-its expiry back, so a session running longer than the TTL keeps its room while anyone
-is still polling, and an abandoned room is collected a TTL after the last request
-rather than a TTL after it opened.
+A joiner count excludes the host, who holds seat 0, so `arena:3` is a room of four.
+`ROOM_TTL` is idle time: any request for a room pushes its expiry back, so a session
+longer than the TTL keeps its room while someone is still polling.
 
 ## Endpoints
 
@@ -67,56 +58,47 @@ rather than a TTL after it opened.
 | `POST /close`               | host drops the room once everyone is connected             |
 | `GET /health`               | `{ok, rooms, version}`                                    |
 
-Seat 0 is the host; joiners are numbered from 1 in arrival order, and what a seat
-entitles a peer to is the app's business. Both reads are destructive: an offer is
-handed over once and an answer is deleted when collected, so a client that loses a
-response cannot ask again.
+Every endpoint except `/ice` and `/health` takes `?app=`. A key is lowercased and
+trimmed, may hold only `a-z`, `0-9` and `-`, and is at most 32 characters; anything
+else is a `400`. Sending no key is legal and lands in an unnamed namespace.
 
-The joiner offers and the host answers, rather than the other way round. An offer
-belongs to one peer connection, so a host cannot publish one offer for three
-joiners, and this way the room code exists before the host has gathered candidates.
+Seat 0 is the host, joiners are numbered from 1 in arrival order, and what a seat
+entitles a peer to is the app's business. Both reads are destructive: an offer is
+handed over once, an answer deleted when collected.
+
+The joiner offers and the host answers. An offer belongs to one peer connection, so a
+host cannot publish one offer for three joiners, and this way the room code exists
+before the host has gathered candidates.
 
 ## Apps
 
 A room is identified by an app and a code together, so several apps can share a
-deployment. A peer holding a live code for the wrong app is told
-`404 no room with that code`, the same thing a made up code gets. Without that the
-join would succeed, the offer would land in the other app's mailbox, and the mismatch
-would surface only when the first message proved unreadable, by which point the room
-has spent a seat it never gets back.
+deployment and a peer holding a live code for the wrong app gets the same
+`404 no room with that code` as a made up one. Without that the join would succeed
+and the room would spend a seat on a peer that can never use it.
 
-Every endpoint except `/ice` and `/health` takes the app as `?app=`. A key is
-lowercased and trimmed, may hold only `a-z`, `0-9` and `-`, and is at most 32
-characters; anything else is a `400`. Sending no key is legal and lands in an unnamed
-namespace, which is what lets a client written before app keys existed keep working.
+`APPS` sets each app's joiner cap and closes the set of keys. Closing it leaves the
+unnamed namespace unconfigured, so set `APPS` only once clients send keys.
 
-Setting `APPS` does two things: it gives each app its own joiner cap, and it closes
-the set of keys so a typo becomes an error rather than a namespace of its own. Mind
-the ordering, because closing the set leaves the unnamed namespace unconfigured: name
-the apps only once the clients are sending keys.
-
-This is namespacing, not authentication. A modified client can claim any key it
-likes. It prevents accidents and collisions in a shared code space, nothing more.
+Namespacing, not authentication: a modified client can claim any key.
 
 ## Relays
 
-Some routers assign a different external port per destination, so the address a peer
-learns from STUN is useless to anyone else and hole punching cannot work. The only
-fix is a relay both peers connect out to, which copies packets between them.
-Published figures put the share of consumer sessions needing one at 15 to 30
-percent, with friends on home broadband at the bottom of that range.
+Some routers assign a different external port per destination, so the address STUN
+reports is useless to anyone else and hole punching fails. The fix is a relay both
+peers connect out to. Published figures put the share of consumer sessions needing
+one at 15 to 30 percent.
 
-This service does not run one. A TURN allocation listens on a port of its own, which
-cannot sit behind an HTTP reverse proxy, and relayed traffic costs bandwidth on the
-machine carrying it.
+This server does not run one: a TURN allocation needs a port of its own, which cannot
+sit behind an HTTP reverse proxy, and relayed traffic costs bandwidth on the machine
+carrying it.
 
-It does mint the credentials for a relay run elsewhere, the scheme coturn calls
+It does mint credentials for a relay run elsewhere, the scheme coturn calls
 `use-auth-secret`: the username is an expiry plus a name, the password its HMAC-SHA1
-under a shared secret, and the relay recomputes the HMAC rather than looking
-anything up. Nothing is stored and a leaked credential expires on its own. Point
-`TURN_SECRET` and `TURN_URLS` at a coturn you run, a managed service, or nothing.
-`turns:` on 443 is the variant worth having, since it survives networks that block
-UDP and unfamiliar ports.
+under a shared secret, and the relay recomputes the HMAC. Nothing is stored and a
+leaked credential expires on its own. Point `TURN_SECRET` and `TURN_URLS` at a coturn,
+a managed service, or nothing. `turns:` on 443 survives networks that block UDP and
+unfamiliar ports.
 
 ## Docker
 
@@ -129,7 +111,5 @@ docker run -p 8001:8001 \
 ```
 
 `:edge` and the short commit are published on every push to main; `:latest` and a
-version arrive with a `v*` tag, so until the first release `:edge` is the only
-moving tag. CI runs gofmt, vet, the suite and the race detector on every push and
-pull request, and publishing uses the built-in `GITHUB_TOKEN`, so there are no
-registry secrets.
+version arrive with a `v*` tag. CI runs gofmt, vet, the suite and the race detector
+on every push and pull request, and publishing uses the built-in `GITHUB_TOKEN`.
