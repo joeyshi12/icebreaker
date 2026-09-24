@@ -8,7 +8,7 @@ import (
 	"github.com/joeyshi12/icebreaker/internal/config"
 )
 
-func TestDefaultsAreSignallingOnly(t *testing.T) {
+func TestDefaultsAreSTUNOnly(t *testing.T) {
 	cfg := config.Load()
 	if cfg.Port != 8001 {
 		t.Fatalf("port %d", cfg.Port)
