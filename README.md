@@ -42,8 +42,12 @@ states the config is in.
 | `TURN_TTL`    | 1h                             | credential lifetime                           |
 | `ROOM_TTL`    | 15m                            | how long an unused room lives                 |
 | `MAX_ROOMS`   | 500                            | across every app, because it guards memory    |
-| `MAX_JOINERS` | 3                              | joiners per room, for apps `APPS` omits       |
-| `APPS`        | none                           | `arena:3,quiz:11`, which also closes the set  |
+| `MAX_JOINERS` | 3                              | joiners a room takes, for apps `APPS` omits   |
+| `APPS`        | none                           | optional: joiners per app, `arena:3,quiz:11`  |
+
+A joiner count excludes the host, who holds seat 0 and never occupies one, so
+`arena:3` means four browsers in a room, as does the default of 3. `APPS` itself is
+optional: leave it unset and any app key is accepted at `MAX_JOINERS`.
 
 ## Endpoints
 
@@ -81,10 +85,10 @@ lowercased and trimmed, may hold only `a-z`, `0-9` and `-`, and is at most 32
 characters; anything else is a `400`. Sending no key is legal and lands in an unnamed
 namespace, which is what lets a client written before app keys existed keep working.
 
-`APPS` sets each app's joiner cap and closes the set of keys, so a typo becomes an
-error rather than a namespace of its own. Mind the ordering: closing the set leaves
-the unnamed namespace unconfigured, so name the apps only once the clients are
-sending keys.
+Setting `APPS` does two things: it gives each app its own joiner cap, and it closes
+the set of keys so a typo becomes an error rather than a namespace of its own. Mind
+the ordering, because closing the set leaves the unnamed namespace unconfigured: name
+the apps only once the clients are sending keys.
 
 This is namespacing, not authentication. A modified client can claim any key it
 likes. It prevents accidents and collisions in a shared code space, nothing more.
