@@ -1,4 +1,4 @@
-// Package api serves what the games talk to.
+// Package api serves what the apps talk to.
 package api
 
 import (
@@ -85,16 +85,16 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	s.send(w, map[string]any{"ok": true, "rooms": s.cfg.Rooms.Len(), "version": s.cfg.Version})
 }
 
-// game reads the namespace a request is for. Absent means the empty namespace,
-// which is where a client that has never heard of game keys lands, so adding keys
+// app reads the namespace a request is for. Absent means the empty namespace,
+// which is where a client that has never heard of app keys lands, so adding keys
 // does not strand one that predates them.
-func (s *Server) game(w http.ResponseWriter, r *http.Request) (string, bool) {
-	game := room.NormalizeGame(r.URL.Query().Get("game"))
-	if !room.ValidGame(game) {
-		s.fail(w, http.StatusBadRequest, "that is not a game")
+func (s *Server) app(w http.ResponseWriter, r *http.Request) (string, bool) {
+	app := room.NormalizeApp(r.URL.Query().Get("app"))
+	if !room.ValidApp(app) {
+		s.fail(w, http.StatusBadRequest, "that is not an app")
 		return "", false
 	}
-	return game, true
+	return app, true
 }
 
 // Not gated on being in a room: the credentials are short lived and useless without the matching relay.
@@ -103,27 +103,27 @@ func (s *Server) ice(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) host(w http.ResponseWriter, r *http.Request) {
-	game, ok := s.game(w, r)
+	app, ok := s.app(w, r)
 	if !ok {
 		return
 	}
-	id, err := s.cfg.Rooms.Open(game)
+	id, err := s.cfg.Rooms.Open(app)
 	if err != nil {
 		s.roomError(w, err)
 		return
 	}
-	s.log.Info("room opened", "game", game, "code", id.Code)
+	s.log.Info("room opened", "app", app, "code", id.Code)
 	s.send(w, map[string]any{
 		"code":        id.Code,
-		"game":        game,
+		"app":         app,
 		"expires_in":  int(s.cfg.Rooms.TTL().Seconds()),
-		"max_joiners": s.cfg.Rooms.MaxJoiners(game),
+		"max_joiners": s.cfg.Rooms.MaxJoiners(app),
 		"ice_servers": s.iceServers(),
 	})
 }
 
 func (s *Server) join(w http.ResponseWriter, r *http.Request) {
-	game, ok := s.game(w, r)
+	app, ok := s.app(w, r)
 	if !ok {
 		return
 	}
@@ -138,22 +138,22 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusBadRequest, "an offer is required")
 		return
 	}
-	id := room.ID{Game: game, Code: room.Normalize(body.Code)}
+	id := room.ID{App: app, Code: room.Normalize(body.Code)}
 	seat, err := s.cfg.Rooms.Join(id, *body.Offer)
 	if err != nil {
 		s.roomError(w, err)
 		return
 	}
-	s.log.Info("joiner arrived", "game", game, "code", id.Code, "seat", seat)
+	s.log.Info("joiner arrived", "app", app, "code", id.Code, "seat", seat)
 	s.send(w, map[string]any{"seat": seat, "ice_servers": s.iceServers()})
 }
 
 func (s *Server) offers(w http.ResponseWriter, r *http.Request) {
-	game, ok := s.game(w, r)
+	app, ok := s.app(w, r)
 	if !ok {
 		return
 	}
-	fresh, err := s.cfg.Rooms.TakeOffers(room.ID{Game: game, Code: room.Normalize(r.PathValue("code"))})
+	fresh, err := s.cfg.Rooms.TakeOffers(room.ID{App: app, Code: room.Normalize(r.PathValue("code"))})
 	if err != nil {
 		s.roomError(w, err)
 		return
@@ -166,7 +166,7 @@ func (s *Server) offers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) answer(w http.ResponseWriter, r *http.Request) {
-	game, ok := s.game(w, r)
+	app, ok := s.app(w, r)
 	if !ok {
 		return
 	}
@@ -182,7 +182,7 @@ func (s *Server) answer(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusBadRequest, "that is not an answer")
 		return
 	}
-	id := room.ID{Game: game, Code: room.Normalize(body.Code)}
+	id := room.ID{App: app, Code: room.Normalize(body.Code)}
 	if err := s.cfg.Rooms.PutAnswer(id, body.Seat, *body.Answer); err != nil {
 		s.roomError(w, err)
 		return
@@ -191,7 +191,7 @@ func (s *Server) answer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) takeAnswer(w http.ResponseWriter, r *http.Request) {
-	game, ok := s.game(w, r)
+	app, ok := s.app(w, r)
 	if !ok {
 		return
 	}
@@ -200,7 +200,7 @@ func (s *Server) takeAnswer(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusNotFound, room.ErrNoSeat.Error())
 		return
 	}
-	id := room.ID{Game: game, Code: room.Normalize(r.PathValue("code"))}
+	id := room.ID{App: app, Code: room.Normalize(r.PathValue("code"))}
 	answer, ok2, err := s.cfg.Rooms.TakeAnswer(id, seat)
 	if err != nil {
 		s.roomError(w, err)
@@ -214,7 +214,7 @@ func (s *Server) takeAnswer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) close(w http.ResponseWriter, r *http.Request) {
-	game, ok := s.game(w, r)
+	app, ok := s.app(w, r)
 	if !ok {
 		return
 	}
@@ -224,7 +224,7 @@ func (s *Server) close(w http.ResponseWriter, r *http.Request) {
 	if !s.read(w, r, &body) {
 		return
 	}
-	s.cfg.Rooms.Close(room.ID{Game: game, Code: room.Normalize(body.Code)})
+	s.cfg.Rooms.Close(room.ID{App: app, Code: room.Normalize(body.Code)})
 	s.send(w, map[string]any{"ok": true})
 }
 
@@ -275,7 +275,7 @@ func (s *Server) roomError(w http.ResponseWriter, err error) {
 		s.fail(w, http.StatusNotFound, err.Error())
 	// only reachable from /host, where the caller is configuring rather than
 	// guessing, so saying which part is wrong costs nothing
-	case errors.Is(err, room.ErrUnknownGame):
+	case errors.Is(err, room.ErrUnknownApp):
 		s.fail(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, room.ErrBusy):
 		s.fail(w, http.StatusServiceUnavailable, "too many rooms open, try again shortly")

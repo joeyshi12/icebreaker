@@ -47,7 +47,7 @@ func TestExpiryIsNowPlusTheTTL(t *testing.T) {
 	}
 }
 
-func TestMintedUsernameNamesNoGame(t *testing.T) {
+func TestMintedUsernameNamesNoApp(t *testing.T) {
 	c := creds.New("sekrit", time.Hour)
 	c.Now = func() time.Time { return time.Unix(1_000_000, 0) }
 	username, _ := c.Mint()

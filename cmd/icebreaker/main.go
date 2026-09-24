@@ -1,4 +1,4 @@
-// Icebreaker: a WebRTC rendezvous for peer to peer games, and the ICE servers to use.
+// Icebreaker: a WebRTC rendezvous for peer to peer apps, and the ICE servers to use.
 package main
 
 import (
@@ -35,12 +35,12 @@ func main() {
 
 func run(cfg config.Config, log *slog.Logger) error {
 	credentials := creds.New(cfg.TURNSecret, cfg.TURNTTL)
-	rooms := room.NewStore(cfg.RoomTTL, cfg.MaxRooms, cfg.Games)
+	rooms := room.NewStore(cfg.RoomTTL, cfg.MaxRooms, cfg.Apps)
 
-	if cfg.Games.Overrides == nil {
-		log.Info("any game key accepted", "max joiners", cfg.Games.Default)
+	if cfg.Apps.Overrides == nil {
+		log.Info("any app key accepted", "max joiners", cfg.Apps.Default)
 	} else {
-		log.Info("games", "joiners by game", cfg.Games.Overrides)
+		log.Info("apps", "joiners by app", cfg.Apps.Overrides)
 	}
 
 	switch {

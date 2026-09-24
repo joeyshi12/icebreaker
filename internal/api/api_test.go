@@ -31,7 +31,7 @@ type client struct {
 func newClient(t *testing.T, opts ...func(*api.Config)) *client {
 	t.Helper()
 	cfg := api.Config{
-		Rooms: room.NewStore(15*time.Minute, 500, room.Games{Default: 3}),
+		Rooms: room.NewStore(15*time.Minute, 500, room.Apps{Default: 3}),
 		Creds: creds.New("", time.Hour),
 		STUN:  []string{"stun:stun.example:3478"},
 		Log:   slog.New(slog.DiscardHandler),
@@ -222,7 +222,7 @@ func TestRubbishIsRejected(t *testing.T) {
 
 func TestExpiredRoomIsGone(t *testing.T) {
 	c := newClient(t, func(cfg *api.Config) {
-		cfg.Rooms = room.NewStore(30*time.Millisecond, 500, room.Games{Default: 3})
+		cfg.Rooms = room.NewStore(30*time.Millisecond, 500, room.Apps{Default: 3})
 	})
 	code := c.open()
 	time.Sleep(60 * time.Millisecond)
@@ -304,104 +304,104 @@ func TestHealthCarriesTheBuildVersion(t *testing.T) {
 }
 
 // The namespace is a namespace, not a hint: a peer holding a live code for the
-// wrong game is told exactly what a peer holding a made up code is told, and the
+// wrong app is told exactly what a peer holding a made up code is told, and the
 // room it missed is no fuller for the attempt.
-func TestAJoinerInTheWrongGameLooksLikeAStranger(t *testing.T) {
+func TestAJoinerInTheWrongAppLooksLikeAStranger(t *testing.T) {
 	c := newClient(t, func(cfg *api.Config) {
-		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Games{
+		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Apps{
 			Overrides: map[string]int{"arena": 3, "quiz": 11},
 		})
 	})
-	status, opened := c.do("POST", "/host?game=arena", map[string]any{})
+	status, opened := c.do("POST", "/host?app=arena", map[string]any{})
 	if status != http.StatusOK {
 		t.Fatalf("host: %d", status)
 	}
 	code := opened["code"].(string)
-	if opened["game"] != "arena" {
-		t.Fatalf("game %v", opened["game"])
+	if opened["app"] != "arena" {
+		t.Fatalf("app %v", opened["app"])
 	}
 
-	wrongGame, wrongBody := c.do("POST", "/join?game=quiz", map[string]any{"code": code, "offer": testOffer})
-	stranger, strangerBody := c.do("POST", "/join?game=quiz", map[string]any{"code": "ZZZZ", "offer": testOffer})
-	if wrongGame != http.StatusNotFound || stranger != http.StatusNotFound {
-		t.Fatalf("wrong game %d, made up code %d, both should be 404", wrongGame, stranger)
+	wrongApp, wrongBody := c.do("POST", "/join?app=quiz", map[string]any{"code": code, "offer": testOffer})
+	stranger, strangerBody := c.do("POST", "/join?app=quiz", map[string]any{"code": "ZZZZ", "offer": testOffer})
+	if wrongApp != http.StatusNotFound || stranger != http.StatusNotFound {
+		t.Fatalf("wrong app %d, made up code %d, both should be 404", wrongApp, stranger)
 	}
 	if wrongBody["error"] != strangerBody["error"] {
-		t.Fatalf("a wrong game says %q and a made up code says %q; they must not be distinguishable",
+		t.Fatalf("a wrong app says %q and a made up code says %q; they must not be distinguishable",
 			wrongBody["error"], strangerBody["error"])
 	}
 
-	for _, path := range []string{"/offers/" + code + "?game=quiz", "/answer/" + code + "/1?game=quiz"} {
+	for _, path := range []string{"/offers/" + code + "?app=quiz", "/answer/" + code + "/1?app=quiz"} {
 		if status, _ := c.do("GET", path, nil); status != http.StatusNotFound {
 			t.Fatalf("GET %s: %d, want 404", path, status)
 		}
 	}
-	if status, _ := c.do("POST", "/answer?game=quiz", map[string]any{"code": code, "seat": 1, "answer": testAnswer}); status != http.StatusNotFound {
-		t.Fatalf("answering into another game: %d", status)
+	if status, _ := c.do("POST", "/answer?app=quiz", map[string]any{"code": code, "seat": 1, "answer": testAnswer}); status != http.StatusNotFound {
+		t.Fatalf("answering into another app: %d", status)
 	}
-	c.do("POST", "/close?game=quiz", map[string]any{"code": code})
+	c.do("POST", "/close?app=quiz", map[string]any{"code": code})
 
-	status, joined := c.do("POST", "/join?game=arena", map[string]any{"code": code, "offer": testOffer})
+	status, joined := c.do("POST", "/join?app=arena", map[string]any{"code": code, "offer": testOffer})
 	if status != http.StatusOK {
-		t.Fatalf("the real game should still be able to join: %d", status)
+		t.Fatalf("the real app should still be able to join: %d", status)
 	}
 	if seat := int(joined["seat"].(float64)); seat != 1 {
-		t.Fatalf("seat %d: the failed cross game attempts cost the room a seat", seat)
+		t.Fatalf("seat %d: the failed cross app attempts cost the room a seat", seat)
 	}
 }
 
-func TestMaxJoinersIsReportedPerGame(t *testing.T) {
+func TestMaxJoinersIsReportedPerApp(t *testing.T) {
 	c := newClient(t, func(cfg *api.Config) {
-		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Games{
+		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Apps{
 			Overrides: map[string]int{"small": 1, "large": 5},
 		})
 	})
-	for game, want := range map[string]float64{"small": 1, "large": 5} {
-		_, opened := c.do("POST", "/host?game="+game, map[string]any{})
+	for app, want := range map[string]float64{"small": 1, "large": 5} {
+		_, opened := c.do("POST", "/host?app="+app, map[string]any{})
 		if opened["max_joiners"] != want {
-			t.Fatalf("%s reported max_joiners %v, want %v", game, opened["max_joiners"], want)
+			t.Fatalf("%s reported max_joiners %v, want %v", app, opened["max_joiners"], want)
 		}
 	}
 
-	_, opened := c.do("POST", "/host?game=small", map[string]any{})
+	_, opened := c.do("POST", "/host?app=small", map[string]any{})
 	code := opened["code"].(string)
-	c.do("POST", "/join?game=small", map[string]any{"code": code, "offer": testOffer})
-	if status, _ := c.do("POST", "/join?game=small", map[string]any{"code": code, "offer": testOffer}); status != http.StatusConflict {
-		t.Fatalf("a one seat game should turn away a second joiner: %d", status)
+	c.do("POST", "/join?app=small", map[string]any{"code": code, "offer": testOffer})
+	if status, _ := c.do("POST", "/join?app=small", map[string]any{"code": code, "offer": testOffer}); status != http.StatusConflict {
+		t.Fatalf("a one seat app should turn away a second joiner: %d", status)
 	}
 }
 
-func TestAnUnconfiguredGameCannotOpenARoom(t *testing.T) {
+func TestAnUnconfiguredAppCannotOpenARoom(t *testing.T) {
 	c := newClient(t, func(cfg *api.Config) {
-		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Games{Overrides: map[string]int{"arena": 3}})
+		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Apps{Overrides: map[string]int{"arena": 3}})
 	})
-	status, body := c.do("POST", "/host?game=typo", map[string]any{})
+	status, body := c.do("POST", "/host?app=typo", map[string]any{})
 	if status != http.StatusBadRequest {
 		t.Fatalf("status %d, want 400", status)
 	}
-	if body["error"] != room.ErrUnknownGame.Error() {
+	if body["error"] != room.ErrUnknownApp.Error() {
 		t.Fatalf("error %v", body["error"])
 	}
-	if status, _ := c.do("POST", "/host?game=arena", map[string]any{}); status != http.StatusOK {
-		t.Fatalf("a configured game: %d", status)
+	if status, _ := c.do("POST", "/host?app=arena", map[string]any{}); status != http.StatusOK {
+		t.Fatalf("a configured app: %d", status)
 	}
 }
 
-func TestGameKeysAreCheckedBeforeTheyBecomeMapKeys(t *testing.T) {
+func TestAppKeysAreCheckedBeforeTheyBecomeMapKeys(t *testing.T) {
 	c := newClient(t)
 	for _, bad := range []string{"arena two", "arena/../x", "a@b", strings.Repeat("a", 33)} {
-		path := "/host?game=" + url.QueryEscape(bad)
+		path := "/host?app=" + url.QueryEscape(bad)
 		status, body := c.do("POST", path, map[string]any{})
 		if status != http.StatusBadRequest {
-			t.Fatalf("game %q gave %d, want 400", bad, status)
+			t.Fatalf("app %q gave %d, want 400", bad, status)
 		}
-		if body["error"] != "that is not a game" {
-			t.Fatalf("game %q gave error %v", bad, body["error"])
+		if body["error"] != "that is not an app" {
+			t.Fatalf("app %q gave error %v", bad, body["error"])
 		}
 	}
 	// upper case is a spelling of a valid key, not an invalid one
-	status, opened := c.do("POST", "/host?game=ARENA", map[string]any{})
-	if status != http.StatusOK || opened["game"] != "arena" {
-		t.Fatalf("ARENA should normalize: %d %v", status, opened["game"])
+	status, opened := c.do("POST", "/host?app=ARENA", map[string]any{})
+	if status != http.StatusOK || opened["app"] != "arena" {
+		t.Fatalf("ARENA should normalize: %d %v", status, opened["app"])
 	}
 }
