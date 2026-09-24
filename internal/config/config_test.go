@@ -23,11 +23,14 @@ func TestDefaultsAreSTUNOnly(t *testing.T) {
 		t.Fatalf("max joiners %d, which is four peers per room", cfg.Apps.Default)
 	}
 	if cfg.Apps.Overrides != nil {
-		t.Fatalf("apps %v: unset APPS leaves the set of app keys open", cfg.Apps.Overrides)
+		t.Fatalf("apps %v: unset APPS means no per app caps", cfg.Apps.Overrides)
+	}
+	if cfg.RejectedApps != nil {
+		t.Fatalf("rejected %v with APPS unset", cfg.RejectedApps)
 	}
 }
 
-func TestAppsClosesTheSetAndCapsEachOne(t *testing.T) {
+func TestAppsCapsEachOneAndLeavesTheRestOnTheDefault(t *testing.T) {
 	t.Setenv("APPS", "arena:3, quiz-night:11 ,")
 	cfg := config.Load()
 	if got := cfg.Apps.MaxJoiners("arena"); got != 3 {
@@ -36,12 +39,9 @@ func TestAppsClosesTheSetAndCapsEachOne(t *testing.T) {
 	if got := cfg.Apps.MaxJoiners("quiz-night"); got != 11 {
 		t.Fatalf("quiz-night cap %d", got)
 	}
-	if !cfg.Apps.Allows("arena") || !cfg.Apps.Allows("quiz-night") {
-		t.Fatal("both configured apps should be allowed")
-	}
 	for _, other := range []string{"", "typo", "arena3"} {
-		if cfg.Apps.Allows(other) {
-			t.Fatalf("naming apps should close the set, but %q was allowed", other)
+		if got := cfg.Apps.MaxJoiners(other); got != cfg.Apps.Default {
+			t.Fatalf("%q should be on the default of %d, got %d", other, cfg.Apps.Default, got)
 		}
 	}
 }
@@ -72,8 +72,11 @@ func TestOneBadEntryDoesNotTakeTheGoodOnesWithIt(t *testing.T) {
 	if got := cfg.Apps.MaxJoiners("quiz"); got != 11 {
 		t.Fatalf("quiz cap %d", got)
 	}
-	if cfg.Apps.Allows("broken") {
-		t.Fatal("an entry with no cap should not become an app")
+	if got := cfg.Apps.MaxJoiners("broken"); got != cfg.Apps.Default {
+		t.Fatalf("a rejected entry should leave that app on the default, got %d", got)
+	}
+	if want := []string{"broken"}; !slices.Equal(cfg.RejectedApps, want) {
+		t.Fatalf("rejected %v, want %v: a dropped entry has to be reported", cfg.RejectedApps, want)
 	}
 }
 

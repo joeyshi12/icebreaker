@@ -371,19 +371,28 @@ func TestMaxJoinersIsReportedPerApp(t *testing.T) {
 	}
 }
 
-func TestAnUnconfiguredAppCannotOpenARoom(t *testing.T) {
+// An app nobody named still opens rooms, at the default cap. This is the property
+// that lets a client written before app keys existed keep working after another app
+// has been given a bigger lobby.
+func TestAnUnnamedAppStillOpensRoomsAtTheDefault(t *testing.T) {
 	c := newClient(t, func(cfg *api.Config) {
-		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Apps{Overrides: map[string]int{"arena": 3}})
+		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Apps{
+			Default:   3,
+			Overrides: map[string]int{"arena": 11},
+		})
 	})
-	status, body := c.do("POST", "/host?app=typo", map[string]any{})
-	if status != http.StatusBadRequest {
-		t.Fatalf("status %d, want 400", status)
-	}
-	if body["error"] != room.ErrUnknownApp.Error() {
-		t.Fatalf("error %v", body["error"])
-	}
-	if status, _ := c.do("POST", "/host?app=arena", map[string]any{}); status != http.StatusOK {
-		t.Fatalf("a configured app: %d", status)
+	for app, want := range map[string]float64{"arena": 11, "typo": 3, "": 3} {
+		path := "/host"
+		if app != "" {
+			path += "?app=" + app
+		}
+		status, opened := c.do("POST", path, map[string]any{})
+		if status != http.StatusOK {
+			t.Fatalf("host for %q: %d", app, status)
+		}
+		if opened["max_joiners"] != want {
+			t.Fatalf("%q reported max_joiners %v, want %v", app, opened["max_joiners"], want)
+		}
 	}
 }
 

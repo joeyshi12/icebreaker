@@ -273,10 +273,6 @@ func (s *Server) roomError(w http.ResponseWriter, err error) {
 		s.fail(w, http.StatusConflict, err.Error())
 	case errors.Is(err, room.ErrNoSeat):
 		s.fail(w, http.StatusNotFound, err.Error())
-	// only reachable from /host, where the caller is configuring rather than
-	// guessing, so saying which part is wrong costs nothing
-	case errors.Is(err, room.ErrUnknownApp):
-		s.fail(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, room.ErrBusy):
 		s.fail(w, http.StatusServiceUnavailable, "too many rooms open, try again shortly")
 	default:

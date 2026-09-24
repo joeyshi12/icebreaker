@@ -18,11 +18,10 @@ const (
 )
 
 var (
-	ErrNoRoom     = errors.New("no room with that code")
-	ErrFull       = errors.New("that room is full")
-	ErrNoSeat     = errors.New("no such seat")
-	ErrBusy       = errors.New("could not allocate a code")
-	ErrUnknownApp = errors.New("no such app")
+	ErrNoRoom = errors.New("no room with that code")
+	ErrFull   = errors.New("that room is full")
+	ErrNoSeat = errors.New("no such seat")
+	ErrBusy   = errors.New("could not allocate a code")
 )
 
 // ID identifies a room. The app is half of the key, so a code belonging to one app
@@ -34,20 +33,14 @@ type ID struct {
 	Code string
 }
 
-// Apps is how many joiners each app allows. A nil Overrides accepts any app key
-// at the default; a non-nil one closes the set to the keys it names, so a
-// client that sends a key nobody configured cannot open a namespace by typo.
+// Apps is how many joiners each app allows. Any app key is accepted; the ones
+// Overrides names get their own cap and the rest get Default. There is no allowlist
+// on purpose: an unrecognised key only ever means a room nobody else can find, which
+// the host discovers the moment a friend reads the code back, and MAX_ROOMS bounds
+// the memory whatever keys exist.
 type Apps struct {
 	Default   int
 	Overrides map[string]int
-}
-
-func (a Apps) Allows(app string) bool {
-	if a.Overrides == nil {
-		return true
-	}
-	_, ok := a.Overrides[app]
-	return ok
 }
 
 func (a Apps) MaxJoiners(app string) int {
@@ -116,9 +109,6 @@ func (s *Store) Len() int {
 // Open reserves a code for an app. MAX_ROOMS is a limit on the whole process, not
 // on one app, because what it protects is this machine's memory.
 func (s *Store) Open(app string) (ID, error) {
-	if !s.apps.Allows(app) {
-		return ID{}, ErrUnknownApp
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.rooms) >= s.maxRooms {

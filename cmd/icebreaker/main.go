@@ -37,10 +37,10 @@ func run(cfg config.Config, log *slog.Logger) error {
 	credentials := creds.New(cfg.TURNSecret, cfg.TURNTTL)
 	rooms := room.NewStore(cfg.RoomTTL, cfg.MaxRooms, cfg.Apps)
 
-	if cfg.Apps.Overrides == nil {
-		log.Info("any app key accepted", "max joiners", cfg.Apps.Default)
-	} else {
-		log.Info("apps", "joiners by app", cfg.Apps.Overrides)
+	log.Info("app joiner caps", "default", cfg.Apps.Default, "by app", cfg.Apps.Overrides)
+	for _, bad := range cfg.RejectedApps {
+		log.Warn("ignoring an unparseable APPS entry, that app falls back to the default",
+			"entry", bad, "default", cfg.Apps.Default)
 	}
 
 	switch {
