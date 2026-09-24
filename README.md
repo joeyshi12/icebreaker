@@ -1,8 +1,9 @@
 # icebreaker
 
-A WebRTC rendezvous for peer to peer browser apps: room codes, the SDP handover
-between a host and its joiners, and the ICE servers they need. One static binary,
-standard library only. Games are the obvious use, but nothing here assumes one.
+A WebRTC signalling server for peer to peer browser apps: room codes, the SDP
+handover between a host and its joiners, and the ICE servers they need. One static
+binary, standard library only. Games are the obvious use, but nothing here assumes
+one.
 
 The name is the job. It hands out ICE servers, and it introduces peers who have
 never met so they can talk among themselves.

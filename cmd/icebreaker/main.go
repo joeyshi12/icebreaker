@@ -1,4 +1,4 @@
-// Icebreaker: a WebRTC rendezvous for peer to peer apps, and the ICE servers to use.
+// Icebreaker: a WebRTC signalling server for peer to peer apps, and the ICE servers to use.
 package main
 
 import (
