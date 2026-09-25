@@ -93,7 +93,10 @@ func run(cfg config.Config, log *slog.Logger) error {
 	return server.Shutdown(ctx)
 }
 
-// sweep drops expired rooms until the returned function is called.
+// sweep drops expired rooms until the returned function is called. A room with anybody
+// in it is touched by that peer's keepalive and a room whose host hangs up is dropped
+// there and then, so this only collects one whose host went without the connection
+// noticing.
 func sweep(rooms *room.Store, log *slog.Logger) func() {
 	ticker := time.NewTicker(sweepEvery)
 	done := make(chan struct{})

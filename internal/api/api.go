@@ -1,19 +1,16 @@
-// Package api serves what the apps talk to.
+// Package api serves what the apps talk to: signalling over one WebSocket per peer at
+// /ws, plus the two endpoints that answer a question rather than joining a conversation.
 package api
 
 import (
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"net/http"
 	"slices"
-	"strconv"
 
 	"github.com/joeyshi12/icebreaker/internal/creds"
 	"github.com/joeyshi12/icebreaker/internal/room"
 )
-
-const maxBody = 64 << 10
 
 type ICEServer struct {
 	URLs       []string `json:"urls"`
@@ -48,15 +45,12 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("GET /ice", s.ice)
-	mux.HandleFunc("POST /host", s.host)
-	mux.HandleFunc("POST /join", s.join)
-	mux.HandleFunc("GET /offers/{code}", s.offers)
-	mux.HandleFunc("POST /answer", s.answer)
-	mux.HandleFunc("GET /answer/{code}/{seat}", s.takeAnswer)
-	mux.HandleFunc("POST /close", s.close)
+	mux.HandleFunc("GET /ws", s.ws)
 	return s.cors(mux)
 }
 
+// cors is also the origin allowlist for /ws: a disallowed origin is refused here, before
+// anything is upgraded, which is why the upgrade handler does not check again.
 func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
@@ -71,7 +65,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 		}
 		w.Header().Set("Access-Control-Allow-Headers", "content-type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 		w.Header().Set("Access-Control-Max-Age", "600")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -85,9 +79,8 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	s.send(w, map[string]any{"ok": true, "rooms": s.cfg.Rooms.Len(), "version": s.cfg.Version})
 }
 
-// app reads the namespace a request is for. Absent means the empty namespace,
-// which is where a client that has never heard of app keys lands, so adding keys
-// does not strand one that predates them.
+// Absent means the empty namespace, so adding app keys does not strand a client that
+// predates them.
 func (s *Server) app(w http.ResponseWriter, r *http.Request) (string, bool) {
 	app := room.NormalizeApp(r.URL.Query().Get("app"))
 	if !room.ValidApp(app) {
@@ -97,135 +90,10 @@ func (s *Server) app(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return app, true
 }
 
-// Not gated on being in a room: the credentials are short lived and useless without the matching relay.
+// Not gated on being in a room: the credentials are short lived and useless without the
+// matching relay.
 func (s *Server) ice(w http.ResponseWriter, r *http.Request) {
 	s.send(w, map[string]any{"ice_servers": s.iceServers()})
-}
-
-func (s *Server) host(w http.ResponseWriter, r *http.Request) {
-	app, ok := s.app(w, r)
-	if !ok {
-		return
-	}
-	id, err := s.cfg.Rooms.Open(app)
-	if err != nil {
-		s.roomError(w, err)
-		return
-	}
-	s.log.Info("room opened", "app", app, "code", id.Code)
-	s.send(w, map[string]any{
-		"code":        id.Code,
-		"app":         app,
-		"expires_in":  int(s.cfg.Rooms.TTL().Seconds()),
-		"max_joiners": s.cfg.Rooms.MaxJoiners(app),
-		"ice_servers": s.iceServers(),
-	})
-}
-
-func (s *Server) join(w http.ResponseWriter, r *http.Request) {
-	app, ok := s.app(w, r)
-	if !ok {
-		return
-	}
-	var body struct {
-		Code  string            `json:"code"`
-		Offer *room.Description `json:"offer"`
-	}
-	if !s.read(w, r, &body) {
-		return
-	}
-	if !body.Offer.Valid("offer") {
-		s.fail(w, http.StatusBadRequest, "an offer is required")
-		return
-	}
-	id := room.ID{App: app, Code: room.Normalize(body.Code)}
-	seat, err := s.cfg.Rooms.Join(id, *body.Offer)
-	if err != nil {
-		s.roomError(w, err)
-		return
-	}
-	s.log.Info("joiner arrived", "app", app, "code", id.Code, "seat", seat)
-	s.send(w, map[string]any{"seat": seat, "ice_servers": s.iceServers()})
-}
-
-func (s *Server) offers(w http.ResponseWriter, r *http.Request) {
-	app, ok := s.app(w, r)
-	if !ok {
-		return
-	}
-	fresh, err := s.cfg.Rooms.TakeOffers(room.ID{App: app, Code: room.Normalize(r.PathValue("code"))})
-	if err != nil {
-		s.roomError(w, err)
-		return
-	}
-	if len(fresh) == 0 {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	s.send(w, map[string]any{"offers": fresh})
-}
-
-func (s *Server) answer(w http.ResponseWriter, r *http.Request) {
-	app, ok := s.app(w, r)
-	if !ok {
-		return
-	}
-	var body struct {
-		Code   string            `json:"code"`
-		Seat   int               `json:"seat"`
-		Answer *room.Description `json:"answer"`
-	}
-	if !s.read(w, r, &body) {
-		return
-	}
-	if !body.Answer.Valid("answer") {
-		s.fail(w, http.StatusBadRequest, "that is not an answer")
-		return
-	}
-	id := room.ID{App: app, Code: room.Normalize(body.Code)}
-	if err := s.cfg.Rooms.PutAnswer(id, body.Seat, *body.Answer); err != nil {
-		s.roomError(w, err)
-		return
-	}
-	s.send(w, map[string]any{"ok": true})
-}
-
-func (s *Server) takeAnswer(w http.ResponseWriter, r *http.Request) {
-	app, ok := s.app(w, r)
-	if !ok {
-		return
-	}
-	seat, err := strconv.Atoi(r.PathValue("seat"))
-	if err != nil {
-		s.fail(w, http.StatusNotFound, room.ErrNoSeat.Error())
-		return
-	}
-	id := room.ID{App: app, Code: room.Normalize(r.PathValue("code"))}
-	answer, ok2, err := s.cfg.Rooms.TakeAnswer(id, seat)
-	if err != nil {
-		s.roomError(w, err)
-		return
-	}
-	if !ok2 {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	s.send(w, map[string]any{"answer": answer})
-}
-
-func (s *Server) close(w http.ResponseWriter, r *http.Request) {
-	app, ok := s.app(w, r)
-	if !ok {
-		return
-	}
-	var body struct {
-		Code string `json:"code"`
-	}
-	if !s.read(w, r, &body) {
-		return
-	}
-	s.cfg.Rooms.Close(room.ID{App: app, Code: room.Normalize(body.Code)})
-	s.send(w, map[string]any{"ok": true})
 }
 
 func (s *Server) iceServers() []ICEServer {
@@ -244,14 +112,6 @@ func (s *Server) iceServers() []ICEServer {
 	return servers
 }
 
-func (s *Server) read(w http.ResponseWriter, r *http.Request, into any) bool {
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody)).Decode(into); err != nil {
-		s.fail(w, http.StatusBadRequest, "malformed request")
-		return false
-	}
-	return true
-}
-
 func (s *Server) send(w http.ResponseWriter, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(body); err != nil {
@@ -263,19 +123,4 @@ func (s *Server) fail(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
-}
-
-func (s *Server) roomError(w http.ResponseWriter, err error) {
-	switch {
-	case errors.Is(err, room.ErrNoRoom):
-		s.fail(w, http.StatusNotFound, err.Error())
-	case errors.Is(err, room.ErrFull):
-		s.fail(w, http.StatusConflict, err.Error())
-	case errors.Is(err, room.ErrNoSeat):
-		s.fail(w, http.StatusNotFound, err.Error())
-	case errors.Is(err, room.ErrBusy):
-		s.fail(w, http.StatusServiceUnavailable, "too many rooms open, try again shortly")
-	default:
-		s.fail(w, http.StatusServiceUnavailable, "try again shortly")
-	}
 }

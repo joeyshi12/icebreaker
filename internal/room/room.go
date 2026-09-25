@@ -24,20 +24,28 @@ var (
 	ErrBusy   = errors.New("could not allocate a code")
 )
 
-// ID identifies a room. The app is half of the key, so a code belonging to one app
-// can never reach another's room: the lookup misses, and the caller is told there is
-// no room with that code, which is all a peer in the wrong app needs to hear. Codes
-// are unique within an app rather than across all of them.
+const (
+	ReasonClosed = "the host closed the room"
+	ReasonGone   = "the host disconnected"
+)
+
+// ID identifies a room. The app is half of the key, so a code from one app misses
+// another's lookup and its holder is told there is no such room.
 type ID struct {
 	App  string
 	Code string
 }
 
-// Apps is how many joiners each app allows. Any app key is accepted; the ones
-// Overrides names get their own cap and the rest get Default. There is no allowlist
-// on purpose: an unrecognised key only ever means a room nobody else can find, which
-// the host discovers the moment a friend reads the code back, and MAX_ROOMS bounds
-// the memory whatever keys exist.
+// Sink is one peer, as a room sees it. No method may block: all three are called with
+// the store's mutex held.
+type Sink interface {
+	Offer(seat int, offer Description)
+	Answer(seat int, answer Description)
+	Closed(reason string)
+}
+
+// Apps is how many joiners each app allows. No allowlist on purpose: an unrecognised key
+// only means a room nobody else can find, and MAX_ROOMS bounds the memory regardless.
 type Apps struct {
 	Default   int
 	Overrides map[string]int
@@ -59,21 +67,23 @@ func (d *Description) Valid(kind string) bool {
 	return d != nil && d.Type == kind && d.SDP != "" && len(d.SDP) < maxSDP
 }
 
-type Offer struct {
-	Seat  int         `json:"seat"`
-	Offer Description `json:"offer"`
-}
-
-type entry struct {
-	offer Offer
-	taken bool
-}
-
 type room struct {
-	seats   int
-	pending []*entry
-	answers map[int]Description
+	host Sink
+	// captured at open, so a seat number means the same thing for the room's whole life
+	max     int
+	seats   map[int]Sink
 	expires time.Time
+}
+
+// freeSeat returns the lowest unoccupied seat. Numbers stay inside the cap rather than
+// climbing, because lf2-showdown uses seat n as an index into player slots 2n and 2n+1.
+func (r *room) freeSeat() (int, bool) {
+	for seat := 1; seat <= r.max; seat++ {
+		if _, taken := r.seats[seat]; !taken {
+			return seat, true
+		}
+	}
+	return 0, false
 }
 
 // Store holds every open room. Every method takes the mutex.
@@ -106,9 +116,8 @@ func (s *Store) Len() int {
 	return len(s.rooms)
 }
 
-// Open reserves a code for an app. MAX_ROOMS is a limit on the whole process, not
-// on one app, because what it protects is this machine's memory.
-func (s *Store) Open(app string) (ID, error) {
+// MAX_ROOMS bounds the whole process rather than one app: what it protects is memory.
+func (s *Store) Open(app string, host Sink) (ID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.rooms) >= s.maxRooms {
@@ -118,83 +127,81 @@ func (s *Store) Open(app string) (ID, error) {
 	if err != nil {
 		return ID{}, err
 	}
-	s.rooms[id] = &room{answers: map[int]Description{}, expires: s.clock().Add(s.ttl)}
+	s.rooms[id] = &room{
+		host:    host,
+		max:     s.apps.MaxJoiners(app),
+		seats:   map[int]Sink{},
+		expires: s.clock().Add(s.ttl),
+	}
 	return id, nil
 }
 
-// Join leaves an offer for the host and returns the seat it was given.
-func (s *Store) Join(id ID, offer Description) (int, error) {
+// A seat is held only while its joiner holds its connection, so a room its players have
+// passed through is joinable again. That is what lets someone who dropped mid-match back in.
+func (s *Store) Join(id ID, offer Description, joiner Sink) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, err := s.live(id)
 	if err != nil {
 		return 0, err
 	}
-	if r.seats >= s.apps.MaxJoiners(id.App) {
+	seat, ok := r.freeSeat()
+	if !ok {
 		return 0, ErrFull
 	}
-	r.seats++
-	r.pending = append(r.pending, &entry{offer: Offer{Seat: r.seats, Offer: offer}})
-	return r.seats, nil
+	r.seats[seat] = joiner
+	r.host.Offer(seat, offer)
+	return seat, nil
 }
 
-// TakeOffers hands each offer over once, because each needs a peer connection of its own.
-func (s *Store) TakeOffers(id ID) ([]Offer, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	r, err := s.live(id)
-	if err != nil {
-		return nil, err
-	}
-	var fresh []Offer
-	for _, e := range r.pending {
-		if !e.taken {
-			e.taken = true
-			fresh = append(fresh, e.offer)
-		}
-	}
-	return fresh, nil
-}
-
-func (s *Store) PutAnswer(id ID, seat int, answer Description) error {
+func (s *Store) Answer(id ID, seat int, answer Description) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, err := s.live(id)
 	if err != nil {
 		return err
 	}
-	for _, e := range r.pending {
-		if e.offer.Seat == seat {
-			r.answers[seat] = answer
-			return nil
-		}
-	}
-	return ErrNoSeat
-}
-
-// TakeAnswer hands the answer to the joiner waiting for it, once.
-func (s *Store) TakeAnswer(id ID, seat int) (Description, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	r, err := s.live(id)
-	if err != nil {
-		return Description{}, false, err
-	}
-	answer, ok := r.answers[seat]
+	joiner, ok := r.seats[seat]
 	if !ok {
-		return Description{}, false, nil
+		return ErrNoSeat
 	}
-	delete(r.answers, seat)
-	return answer, true, nil
+	joiner.Answer(seat, answer)
+	return nil
 }
 
-func (s *Store) Close(id ID) {
+// An unknown room or seat is not an error: a closing socket calls this, and by then the
+// room may already have gone.
+func (s *Store) Leave(id ID, seat int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.rooms, id)
+	if r, ok := s.rooms[id]; ok {
+		delete(r.seats, seat)
+	}
 }
 
-// Sweep drops expired rooms and returns how many went.
+func (s *Store) Close(id ID, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.rooms[id]
+	if !ok {
+		return
+	}
+	delete(s.rooms, id)
+	for _, joiner := range r.seats {
+		joiner.Closed(reason)
+	}
+}
+
+// Touch pushes the expiry back, so a room outlives the TTL while anybody is connected.
+func (s *Store) Touch(id ID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.live(id)
+	return err == nil
+}
+
+// A backstop, with a connection per peer: it collects a room whose host vanished without
+// the socket noticing, which a half open TCP connection can do.
 func (s *Store) Sweep() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -203,26 +210,26 @@ func (s *Store) Sweep() int {
 	for id, r := range s.rooms {
 		if now.After(r.expires) {
 			delete(s.rooms, id)
+			for _, joiner := range r.seats {
+				joiner.Closed(ReasonGone)
+			}
 			dropped++
 		}
 	}
 	return dropped
 }
 
-// Normalize puts a code in the form rooms are keyed by.
 func Normalize(code string) string {
 	return strings.ToUpper(strings.TrimSpace(code))
 }
 
-// NormalizeApp puts an app key in the form rooms are keyed by. Unlike a code it
-// is not read out loud, so it is lowercased rather than uppercased.
+// Lowercased rather than uppercased, because unlike a code it is not read out loud.
 func NormalizeApp(app string) string {
 	return strings.ToLower(strings.TrimSpace(app))
 }
 
-// ValidApp reports whether an app key is one this service will use as a map key
-// at all, before any question of whether it is configured. Empty is valid: it is
-// the namespace of a client that sends no key.
+// ValidApp reports whether a key is usable as a map key at all. Empty is valid: it is the
+// namespace of a client that sends none.
 func ValidApp(app string) bool {
 	if len(app) > maxApp {
 		return false
@@ -237,11 +244,7 @@ func ValidApp(app string) bool {
 	return true
 }
 
-// live returns an unexpired room, deleting it if it expired, and pushes the expiry
-// back. The TTL is idle time rather than total lifetime, so a session outliving it
-// keeps its room while anyone is still asking for it, and an abandoned room is
-// collected a TTL after the last request instead of a TTL after it opened. Callers
-// hold the mutex.
+// The TTL is idle time, not total lifetime. Callers hold the mutex.
 func (s *Store) live(id ID) (*room, error) {
 	r, ok := s.rooms[id]
 	if !ok {

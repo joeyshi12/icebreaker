@@ -1,7 +1,9 @@
 package room_test
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,20 +15,77 @@ var (
 	answer = room.Description{Type: "answer", SDP: "v=0 answer"}
 )
 
-// open rooms in one unnamed namespace, which is what a client that sends no app
-// key gets, and what most of these tests care about
+type said struct {
+	kind   string // "offer", "answer" or "closed"
+	seat   int
+	sdp    string
+	reason string
+}
+
+func (s said) String() string {
+	if s.kind == "closed" {
+		return fmt.Sprintf("closed(%q)", s.reason)
+	}
+	return fmt.Sprintf("%s(seat %d, %q)", s.kind, s.seat, s.sdp)
+}
+
+type spy struct {
+	mu   sync.Mutex
+	logd []said
+}
+
+func (s *spy) Offer(seat int, o room.Description) {
+	s.add(said{kind: "offer", seat: seat, sdp: o.SDP})
+}
+
+func (s *spy) Answer(seat int, a room.Description) {
+	s.add(said{kind: "answer", seat: seat, sdp: a.SDP})
+}
+
+func (s *spy) Closed(reason string) {
+	s.add(said{kind: "closed", reason: reason})
+}
+
+func (s *spy) add(what said) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.logd = append(s.logd, what)
+}
+
+func (s *spy) heard() []said {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]said(nil), s.logd...)
+}
+
+func (s *spy) only(t *testing.T, want said) {
+	t.Helper()
+	got := s.heard()
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("heard %v, want exactly [%v]", got, want)
+	}
+}
+
+func (s *spy) silent(t *testing.T) {
+	t.Helper()
+	if got := s.heard(); len(got) != 0 {
+		t.Fatalf("heard %v, want nothing", got)
+	}
+}
+
 func openStore(ttl time.Duration, maxRooms, joiners int) *room.Store {
 	return room.NewStore(ttl, maxRooms, room.Apps{Default: joiners})
 }
 
 func TestSeatsAreHandedOutInOrder(t *testing.T) {
 	store := openStore(time.Minute, 10, 3)
-	id, err := store.Open("")
+	host := &spy{}
+	id, err := store.Open("", host)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for want := 1; want <= 3; want++ {
-		seat, err := store.Join(id, offer)
+		seat, err := store.Join(id, offer, &spy{})
 		if err != nil {
 			t.Fatalf("join %d: %v", want, err)
 		}
@@ -34,65 +93,108 @@ func TestSeatsAreHandedOutInOrder(t *testing.T) {
 			t.Fatalf("seat %d, want %d", seat, want)
 		}
 	}
-	if _, err := store.Join(id, offer); err != room.ErrFull {
+	if _, err := store.Join(id, offer, &spy{}); err != room.ErrFull {
 		t.Fatalf("a fourth joiner should be turned away, got %v", err)
 	}
 }
 
-func TestOffersAreHandedOverOnce(t *testing.T) {
+func TestAnOfferReachesTheHostAsItArrives(t *testing.T) {
 	store := openStore(time.Minute, 10, 3)
-	id, _ := store.Open("")
-	store.Join(id, offer)
-	store.Join(id, offer)
+	host := &spy{}
+	id, _ := store.Open("", host)
+	host.silent(t)
 
-	first, err := store.TakeOffers(id)
-	if err != nil {
+	if _, err := store.Join(id, offer, &spy{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(first) != 2 {
-		t.Fatalf("offers %d", len(first))
-	}
-	again, err := store.TakeOffers(id)
-	if err != nil {
+	host.only(t, said{kind: "offer", seat: 1, sdp: offer.SDP})
+
+	if _, err := store.Join(id, offer, &spy{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(again) != 0 {
-		t.Fatalf("offers were handed over twice: %d", len(again))
+	if got := host.heard(); len(got) != 2 || got[1].seat != 2 {
+		t.Fatalf("heard %v, want a second offer for seat 2", got)
 	}
 }
 
-func TestAnswerGoesToItsSeatOnce(t *testing.T) {
+func TestAnAnswerReachesItsSeatAndNobodyElse(t *testing.T) {
 	store := openStore(time.Minute, 10, 3)
-	id, _ := store.Open("")
-	store.Join(id, offer)
+	id, _ := store.Open("", &spy{})
+	first, second := &spy{}, &spy{}
+	store.Join(id, offer, first)
+	store.Join(id, offer, second)
 
-	if err := store.PutAnswer(id, 1, answer); err != nil {
+	if err := store.Answer(id, 1, answer); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutAnswer(id, 2, answer); err != room.ErrNoSeat {
-		t.Fatalf("an unknown seat should be refused, got %v", err)
+	first.only(t, said{kind: "answer", seat: 1, sdp: answer.SDP})
+	second.silent(t)
+
+	if err := store.Answer(id, 9, answer); err != room.ErrNoSeat {
+		t.Fatalf("an unoccupied seat should be refused, got %v", err)
+	}
+}
+
+// Without this a lobby three players passed through would be unjoinable for the rest of
+// its life, which is what a player dropping and rejoining mid-match creates.
+func TestALeavingJoinerFreesItsSeat(t *testing.T) {
+	store := openStore(time.Minute, 10, 3)
+	host := &spy{}
+	id, _ := store.Open("", host)
+	for range 3 {
+		store.Join(id, offer, &spy{})
+	}
+	if _, err := store.Join(id, offer, &spy{}); err != room.ErrFull {
+		t.Fatalf("want a full room, got %v", err)
 	}
 
-	got, ok, err := store.TakeAnswer(id, 1)
-	if err != nil || !ok || got.Type != "answer" {
-		t.Fatalf("take: %v %v %v", got, ok, err)
+	store.Leave(id, 2)
+	seat, err := store.Join(id, offer, &spy{})
+	if err != nil {
+		t.Fatalf("the freed seat should be joinable: %v", err)
 	}
-	if _, ok, _ := store.TakeAnswer(id, 1); ok {
-		t.Fatal("an answer should only be handed over once")
+	if seat != 2 {
+		t.Fatalf("seat %d, want the freed 2", seat)
 	}
+}
+
+// lf2-showdown uses seat n as an index into player slots 2n and 2n+1.
+func TestSeatNumbersStayInsideTheCap(t *testing.T) {
+	store := openStore(time.Minute, 10, 3)
+	id, _ := store.Open("", &spy{})
+	for round := range 10 {
+		seat, err := store.Join(id, offer, &spy{})
+		if err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		if seat < 1 || seat > 3 {
+			t.Fatalf("round %d handed out seat %d, outside 1..3", round, seat)
+		}
+		store.Leave(id, seat)
+	}
+}
+
+func TestLeavingSomethingThatIsNotThereIsFine(t *testing.T) {
+	store := openStore(time.Minute, 10, 3)
+	id, _ := store.Open("", &spy{})
+	store.Leave(id, 1)                    // a seat nobody took
+	store.Leave(room.ID{Code: "ZZZZ"}, 1) // a room that never existed
+	store.Close(id, room.ReasonClosed)
+	store.Leave(id, 1) // a room that has gone
+	store.Close(id, room.ReasonClosed)
 }
 
 func TestUnknownCodeIsAnError(t *testing.T) {
 	store := openStore(time.Minute, 10, 3)
 	missing := room.ID{Code: "ZZZZ"}
-	if _, err := store.Join(missing, offer); err != room.ErrNoRoom {
+	if _, err := store.Join(missing, offer, &spy{}); err != room.ErrNoRoom {
 		t.Fatalf("join: %v", err)
 	}
-	if _, err := store.TakeOffers(missing); err != room.ErrNoRoom {
-		t.Fatalf("offers: %v", err)
-	}
-	if err := store.PutAnswer(missing, 1, answer); err != room.ErrNoRoom {
+	if err := store.Answer(missing, 1, answer); err != room.ErrNoRoom {
 		t.Fatalf("answer: %v", err)
+	}
+	if store.Touch(missing) {
+		t.Fatal("touching a room that is not there should say so")
 	}
 }
 
@@ -101,30 +203,26 @@ func TestUnknownCodeIsAnError(t *testing.T) {
 // cannot spend one of the room's seats on the way to finding out.
 func TestARoomIsUnreachableFromAnotherApp(t *testing.T) {
 	store := room.NewStore(time.Minute, 10, room.Apps{Overrides: map[string]int{"arena": 3, "quiz": 11}})
-	arena, err := store.Open("arena")
+	host := &spy{}
+	arena, err := store.Open("arena", host)
 	if err != nil {
 		t.Fatal(err)
 	}
 	wrong := room.ID{App: "quiz", Code: arena.Code}
 
-	if _, err := store.Join(wrong, offer); err != room.ErrNoRoom {
+	if _, err := store.Join(wrong, offer, &spy{}); err != room.ErrNoRoom {
 		t.Fatalf("joining across apps: %v, want %v", err, room.ErrNoRoom)
 	}
-	if _, err := store.TakeOffers(wrong); err != room.ErrNoRoom {
-		t.Fatalf("taking offers across apps: %v", err)
-	}
-	if err := store.PutAnswer(wrong, 1, answer); err != room.ErrNoRoom {
+	if err := store.Answer(wrong, 1, answer); err != room.ErrNoRoom {
 		t.Fatalf("answering across apps: %v", err)
 	}
-	if _, _, err := store.TakeAnswer(wrong, 1); err != room.ErrNoRoom {
-		t.Fatalf("taking an answer across apps: %v", err)
-	}
+	host.silent(t)
 
-	store.Close(wrong)
-	if _, err := store.Join(arena, offer); err != nil {
+	store.Close(wrong, room.ReasonClosed)
+	if _, err := store.Join(arena, offer, &spy{}); err != nil {
 		t.Fatalf("the wrong app closed the real room: %v", err)
 	}
-	if seat, err := store.Join(arena, offer); err != nil || seat != 2 {
+	if seat, err := store.Join(arena, offer, &spy{}); err != nil || seat != 2 {
 		t.Fatalf("seat %d err %v: the failed cross app joins should have cost nothing", seat, err)
 	}
 }
@@ -141,35 +239,32 @@ func TestJoinerCapIsPerApp(t *testing.T) {
 		t.Fatalf("large cap %d", got)
 	}
 
-	small, _ := store.Open("small")
-	if _, err := store.Join(small, offer); err != nil {
+	small, _ := store.Open("small", &spy{})
+	if _, err := store.Join(small, offer, &spy{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Join(small, offer); err != room.ErrFull {
+	if _, err := store.Join(small, offer, &spy{}); err != room.ErrFull {
 		t.Fatalf("a second joiner in a one seat app: %v", err)
 	}
 
-	large, _ := store.Open("large")
+	large, _ := store.Open("large", &spy{})
 	for i := 1; i <= 5; i++ {
-		if _, err := store.Join(large, offer); err != nil {
+		if _, err := store.Join(large, offer, &spy{}); err != nil {
 			t.Fatalf("join %d of a five seat app: %v", i, err)
 		}
 	}
-	if _, err := store.Join(large, offer); err != room.ErrFull {
+	if _, err := store.Join(large, offer, &spy{}); err != room.ErrFull {
 		t.Fatalf("a sixth joiner in a five seat app: %v", err)
 	}
 }
 
-// Any app key opens a room. Naming some in APPS gives those their own cap and leaves
-// everything else on the default, which is what lets a client that predates app keys
-// keep working alongside one that uses them.
 func TestAnyAppKeyOpensARoomAndNamedOnesGetTheirCap(t *testing.T) {
 	store := room.NewStore(time.Minute, 20, room.Apps{
 		Default:   3,
 		Overrides: map[string]int{"arena": 11},
 	})
 	for _, app := range []string{"", "arena", "typo", "anything-at-all"} {
-		if _, err := store.Open(app); err != nil {
+		if _, err := store.Open(app, &spy{}); err != nil {
 			t.Fatalf("opening %q: %v", app, err)
 		}
 	}
@@ -183,63 +278,56 @@ func TestAnyAppKeyOpensARoomAndNamedOnesGetTheirCap(t *testing.T) {
 	}
 }
 
-// The TTL is idle time, not total lifetime. A session longer than the TTL keeps its
-// room while anyone is still polling it, which is what lets a match outlive the
-// default without losing the ability to let a dropped peer back in.
+// The TTL is idle time: a quiet lobby outlives it rather than being collected from under
+// a host still sitting in it.
 func TestUseKeepsARoomAlive(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	store := openStore(time.Minute, 10, 3)
 	store.Now = func() time.Time { return now }
 
-	id, _ := store.Open("")
+	id, _ := store.Open("", &spy{})
 	// eight half-TTL steps, so four times the TTL in total, touched at every one
 	for step := 1; step <= 8; step++ {
 		now = now.Add(30 * time.Second)
-		if _, err := store.TakeOffers(id); err != nil {
-			t.Fatalf("step %d, after %v of continuous use: %v", step, time.Duration(step)*30*time.Second, err)
+		if !store.Touch(id) {
+			t.Fatalf("step %d, after %v of continuous use, the room was gone",
+				step, time.Duration(step)*30*time.Second)
 		}
 	}
 
-	// and it is still collected once nobody asks for it
+	// and it is still collected once nobody is holding it
 	now = now.Add(2 * time.Minute)
-	if _, err := store.TakeOffers(id); err != room.ErrNoRoom {
-		t.Fatalf("an idle room should still expire, got %v", err)
+	if store.Touch(id) {
+		t.Fatal("an idle room should still expire")
 	}
 }
 
-// Every operation that reaches a room counts as use, so the expiry does not depend
-// on which one a client happens to be polling.
 func TestEveryOperationPushesTheExpiryBack(t *testing.T) {
 	cases := []struct {
 		name  string
 		setup func(*room.Store, room.ID)
 		touch func(*room.Store, room.ID)
 	}{
-		{"join", func(*room.Store, room.ID) {}, func(s *room.Store, id room.ID) { s.Join(id, offer) }},
-		{"take offers", func(*room.Store, room.ID) {}, func(s *room.Store, id room.ID) { s.TakeOffers(id) }},
+		{"join", func(*room.Store, room.ID) {}, func(s *room.Store, id room.ID) { s.Join(id, offer, &spy{}) }},
+		{"touch", func(*room.Store, room.ID) {}, func(s *room.Store, id room.ID) { s.Touch(id) }},
 		{
-			"put answer",
-			func(s *room.Store, id room.ID) { s.Join(id, offer) },
-			func(s *room.Store, id room.ID) { s.PutAnswer(id, 1, answer) },
-		},
-		{
-			"take answer",
-			func(s *room.Store, id room.ID) { s.Join(id, offer); s.PutAnswer(id, 1, answer) },
-			func(s *room.Store, id room.ID) { s.TakeAnswer(id, 1) },
+			"answer",
+			func(s *room.Store, id room.ID) { s.Join(id, offer, &spy{}) },
+			func(s *room.Store, id room.ID) { s.Answer(id, 1, answer) },
 		},
 	}
 	for _, c := range cases {
 		now := time.Unix(1_000_000, 0)
 		store := openStore(time.Minute, 10, 3)
 		store.Now = func() time.Time { return now }
-		id, _ := store.Open("")
+		id, _ := store.Open("", &spy{})
 		c.setup(store, id)
 
 		now = now.Add(45 * time.Second) // inside the original minute
 		c.touch(store, id)
 		now = now.Add(45 * time.Second) // past it, but only 45s since the touch
 
-		if _, err := store.TakeOffers(id); err == room.ErrNoRoom {
+		if !store.Touch(id) {
 			t.Fatalf("%s did not push the expiry back", c.name)
 		}
 	}
@@ -250,18 +338,18 @@ func TestRoomsExpireAndSweep(t *testing.T) {
 	store := openStore(time.Minute, 10, 3)
 	store.Now = func() time.Time { return now }
 
-	id, _ := store.Open("")
+	id, _ := store.Open("", &spy{})
 	if store.Len() != 1 {
 		t.Fatalf("rooms %d", store.Len())
 	}
 
 	now = now.Add(2 * time.Minute)
-	if _, err := store.Join(id, offer); err != room.ErrNoRoom {
+	if _, err := store.Join(id, offer, &spy{}); err != room.ErrNoRoom {
 		t.Fatalf("an expired room should be gone, got %v", err)
 	}
 
 	now = time.Unix(2_000_000, 0)
-	store.Open("")
+	store.Open("", &spy{})
 	now = now.Add(2 * time.Minute)
 	if dropped := store.Sweep(); dropped != 1 {
 		t.Fatalf("dropped %d", dropped)
@@ -271,25 +359,53 @@ func TestRoomsExpireAndSweep(t *testing.T) {
 	}
 }
 
+// A room only reaches the sweeper when its host went without the connection saying so, so
+// the joiners are still there to be told.
+func TestSweepTellsTheJoinersLeftBehind(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	store := openStore(time.Minute, 10, 3)
+	store.Now = func() time.Time { return now }
+
+	id, _ := store.Open("", &spy{})
+	joiner := &spy{}
+	store.Join(id, offer, joiner)
+
+	now = now.Add(2 * time.Minute)
+	if dropped := store.Sweep(); dropped != 1 {
+		t.Fatalf("dropped %d", dropped)
+	}
+	joiner.only(t, said{kind: "closed", reason: room.ReasonGone})
+}
+
 func TestMaxRoomsCountsEveryApp(t *testing.T) {
 	store := room.NewStore(time.Minute, 2, room.Apps{Overrides: map[string]int{"a": 1, "b": 1}})
-	if _, err := store.Open("a"); err != nil {
+	if _, err := store.Open("a", &spy{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Open("b"); err != nil {
+	if _, err := store.Open("b", &spy{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Open("a"); err != room.ErrBusy {
+	if _, err := store.Open("a", &spy{}); err != room.ErrBusy {
 		t.Fatalf("the room limit protects this machine, not one app: %v", err)
 	}
 }
 
-func TestClosingDropsTheRoom(t *testing.T) {
+func TestClosingDropsTheRoomAndSaysWhy(t *testing.T) {
 	store := openStore(time.Minute, 10, 3)
-	id, _ := store.Open("")
-	store.Close(id)
-	if _, err := store.Join(id, offer); err != room.ErrNoRoom {
+	id, _ := store.Open("", &spy{})
+	first, second := &spy{}, &spy{}
+	store.Join(id, offer, first)
+	store.Join(id, offer, second)
+
+	store.Close(id, room.ReasonGone)
+	if _, err := store.Join(id, offer, &spy{}); err != room.ErrNoRoom {
 		t.Fatalf("closed room: %v", err)
+	}
+	for who, s := range map[string]*spy{"first": first, "second": second} {
+		got := s.heard()
+		if len(got) != 1 || got[0] != (said{kind: "closed", reason: room.ReasonGone}) {
+			t.Fatalf("%s heard %v, want to be told why the room went", who, got)
+		}
 	}
 }
 
@@ -297,7 +413,7 @@ func TestCodesLookLikeCodes(t *testing.T) {
 	store := openStore(time.Minute, 100, 3)
 	seen := map[string]bool{}
 	for range 50 {
-		id, err := store.Open("")
+		id, err := store.Open("", &spy{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -354,7 +470,7 @@ func TestAppKeysAreNormalizedAndBounded(t *testing.T) {
 			t.Fatalf("%q should be a usable app key", ok)
 		}
 	}
-	// a app key becomes a map key, so it stays short and boring
+	// an app key becomes a map key, so it stays short and boring
 	for _, bad := range []string{"ARENA", "arena two", "arena/../x", "a@b", "qüiz", strings.Repeat("a", 33)} {
 		if room.ValidApp(bad) {
 			t.Fatalf("%q should not be a usable app key", bad)

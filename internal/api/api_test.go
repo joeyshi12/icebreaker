@@ -1,18 +1,17 @@
 package api_test
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/joeyshi12/icebreaker/internal/api"
 	"github.com/joeyshi12/icebreaker/internal/creds"
 	"github.com/joeyshi12/icebreaker/internal/room"
@@ -22,6 +21,9 @@ var (
 	testOffer  = room.Description{Type: "offer", SDP: "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\n"}
 	testAnswer = room.Description{Type: "answer", SDP: "v=0\r\no=- 3 4 IN IP4 127.0.0.1\r\n"}
 )
+
+// A deadlock guard, not a delay anything spends: every message here is a loopback push.
+const patience = 3 * time.Second
 
 type client struct {
 	t      *testing.T
@@ -44,53 +46,118 @@ func newClient(t *testing.T, opts ...func(*api.Config)) *client {
 	return &client{t: t, server: server}
 }
 
-func (c *client) do(method, path string, body any) (int, map[string]any) {
-	c.t.Helper()
-	var reader io.Reader
-	if body != nil {
-		raw, err := json.Marshal(body)
-		if err != nil {
-			c.t.Fatal(err)
-		}
-		reader = bytes.NewReader(raw)
-	}
-	req, err := http.NewRequest(method, c.server.URL+path, reader)
-	if err != nil {
-		c.t.Fatal(err)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		c.t.Fatal(err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode == http.StatusNoContent {
-		return res.StatusCode, nil
-	}
-	var decoded map[string]any
-	if err := json.NewDecoder(res.Body).Decode(&decoded); err != nil {
-		c.t.Fatalf("decoding %s %s: %v", method, path, err)
-	}
-	return res.StatusCode, decoded
+type peer struct {
+	t    *testing.T
+	conn *websocket.Conn
 }
 
-func (c *client) open() string {
+func (c *client) dial(query string) *peer {
 	c.t.Helper()
-	status, room := c.do("POST", "/host", map[string]any{})
-	if status != http.StatusOK {
-		c.t.Fatalf("opening a room: %d", status)
+	conn := c.tryDial(query, nil)
+	if conn == nil {
+		c.t.Fatal("could not open a connection")
 	}
-	return room["code"].(string)
+	return &peer{t: c.t, conn: conn}
+}
+
+func (c *client) tryDial(query string, header http.Header) *websocket.Conn {
+	c.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), patience)
+	defer cancel()
+	addr := strings.Replace(c.server.URL, "http://", "ws://", 1) + "/ws" + query
+	conn, res, err := websocket.Dial(ctx, addr, &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		if res != nil {
+			c.t.Logf("upgrade refused with %d", res.StatusCode)
+		}
+		return nil
+	}
+	c.t.Cleanup(func() { conn.CloseNow() })
+	return conn
+}
+
+func (p *peer) send(v any) {
+	p.t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		p.t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), patience)
+	defer cancel()
+	if err := p.conn.Write(ctx, websocket.MessageText, raw); err != nil {
+		p.t.Fatalf("sending %v: %v", v, err)
+	}
+}
+
+func (p *peer) next() map[string]any {
+	p.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), patience)
+	defer cancel()
+	_, raw, err := p.conn.Read(ctx)
+	if err != nil {
+		p.t.Fatalf("waiting for a message: %v", err)
+	}
+	var msg map[string]any
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		p.t.Fatalf("decoding %q: %v", raw, err)
+	}
+	return msg
+}
+
+// expect reads one message and insists on what it is.
+func (p *peer) expect(kind string) map[string]any {
+	p.t.Helper()
+	msg := p.next()
+	if msg["type"] != kind {
+		p.t.Fatalf("got a %v (%v), want a %s", msg["type"], msg["message"], kind)
+	}
+	return msg
+}
+
+func (p *peer) refused(reason string) {
+	p.t.Helper()
+	msg := p.expect("error")
+	if msg["reason"] != reason {
+		p.t.Fatalf("refused with %q (%v), want %q", msg["reason"], msg["message"], reason)
+	}
+}
+
+// A read that only ends because this test ran out of patience means the connection is
+// still open, so that fails rather than passing.
+func (p *peer) hungUp() {
+	p.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), patience)
+	defer cancel()
+	for {
+		if _, _, err := p.conn.Read(ctx); err != nil {
+			if ctx.Err() != nil {
+				p.t.Fatal("the connection was left open after the room went")
+			}
+			return
+		}
+	}
+}
+
+func (c *client) host(query string) (*peer, string) {
+	c.t.Helper()
+	p := c.dial(query)
+	p.send(map[string]any{"type": "host"})
+	return p, p.expect("hosted")["code"].(string)
+}
+
+func (c *client) join(query, code string) (*peer, int) {
+	c.t.Helper()
+	p := c.dial(query)
+	p.send(map[string]any{"type": "join", "code": code, "offer": testOffer})
+	return p, int(p.expect("joined")["seat"].(float64))
 }
 
 func TestHostAndThreeJoinersEachGetASeat(t *testing.T) {
 	c := newClient(t)
-	status, opened := c.do("POST", "/host", map[string]any{})
-	if status != http.StatusOK {
-		t.Fatalf("host: %d", status)
-	}
+	h := c.dial("")
+	h.send(map[string]any{"type": "host"})
+	opened := h.expect("hosted")
+
 	code := opened["code"].(string)
 	if len(code) != 4 {
 		t.Fatalf("code %q", code)
@@ -99,135 +166,259 @@ func TestHostAndThreeJoinersEachGetASeat(t *testing.T) {
 		t.Fatalf("max_joiners %v", opened["max_joiners"])
 	}
 
+	joiners := map[int]*peer{}
 	for want := 1; want <= 3; want++ {
-		status, joined := c.do("POST", "/join", map[string]any{"code": code, "offer": testOffer})
-		if status != http.StatusOK {
-			t.Fatalf("join %d: %d", want, status)
+		p, seat := c.join("", code)
+		if seat != want {
+			t.Fatalf("seat %d, want %d", seat, want)
 		}
-		if int(joined["seat"].(float64)) != want {
-			t.Fatalf("seat %v, want %d", joined["seat"], want)
+		joiners[seat] = p
+
+		// the host is told, without having asked
+		offered := h.expect("offer")
+		if int(offered["seat"].(float64)) != want {
+			t.Fatalf("the host was told about seat %v, want %d", offered["seat"], want)
+		}
+		if offered["offer"].(map[string]any)["sdp"] != testOffer.SDP {
+			t.Fatalf("the offer arrived as %v", offered["offer"])
 		}
 	}
 
-	status, batch := c.do("GET", "/offers/"+code, nil)
-	if status != http.StatusOK {
-		t.Fatalf("offers: %d", status)
-	}
-	if len(batch["offers"].([]any)) != 3 {
-		t.Fatalf("offers %v", batch["offers"])
-	}
-	if status, _ := c.do("GET", "/offers/"+code, nil); status != http.StatusNoContent {
-		t.Fatalf("second poll: %d", status)
-	}
-
-	for seat := 1; seat <= 3; seat++ {
-		status, _ := c.do("POST", "/answer", map[string]any{"code": code, "seat": seat, "answer": testAnswer})
-		if status != http.StatusOK {
-			t.Fatalf("answer %d: %d", seat, status)
+	for seat, p := range joiners {
+		h.send(map[string]any{"type": "answer", "seat": seat, "answer": testAnswer})
+		got := p.expect("answer")
+		if int(got["seat"].(float64)) != seat {
+			t.Fatalf("seat %d received an answer for %v", seat, got["seat"])
 		}
-	}
-	for seat := 1; seat <= 3; seat++ {
-		path := "/answer/" + code + "/" + strconv.Itoa(seat)
-		status, got := c.do("GET", path, nil)
-		if status != http.StatusOK {
-			t.Fatalf("take answer %d: %d", seat, status)
-		}
-		if got["answer"].(map[string]any)["type"] != "answer" {
+		if got["answer"].(map[string]any)["sdp"] != testAnswer.SDP {
 			t.Fatalf("answer %v", got["answer"])
-		}
-		if status, _ := c.do("GET", path, nil); status != http.StatusNoContent {
-			t.Fatalf("answer handed over twice for seat %d", seat)
 		}
 	}
 }
 
-func TestRoomStaysOpenBetweenJoiners(t *testing.T) {
+func TestAnOfferArrivesWithoutBeingAskedFor(t *testing.T) {
 	c := newClient(t)
-	code := c.open()
+	h, code := c.host("")
+	c.join("", code)
+	if seat := h.expect("offer")["seat"]; seat != float64(1) {
+		t.Fatalf("seat %v", seat)
+	}
+}
 
-	c.do("POST", "/join", map[string]any{"code": code, "offer": testOffer})
-	c.do("GET", "/offers/"+code, nil)
-	c.do("POST", "/answer", map[string]any{"code": code, "seat": 1, "answer": testAnswer})
-	c.do("GET", "/answer/"+code+"/1", nil)
+func TestAnAnswerReachesOnlyItsJoiner(t *testing.T) {
+	c := newClient(t)
+	h, code := c.host("")
+	first, _ := c.join("", code)
+	second, _ := c.join("", code)
+	h.expect("offer")
+	h.expect("offer")
 
-	status, second := c.do("POST", "/join", map[string]any{"code": code, "offer": testOffer})
-	if status != http.StatusOK || int(second["seat"].(float64)) != 2 {
-		t.Fatalf("a second joiner should still be able to arrive: %d %v", status, second)
+	h.send(map[string]any{"type": "answer", "seat": 2, "answer": testAnswer})
+	if got := second.expect("answer"); int(got["seat"].(float64)) != 2 {
+		t.Fatalf("seat %v", got["seat"])
+	}
+
+	// and the first joiner is still waiting, rather than holding somebody else's answer
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if _, raw, err := first.conn.Read(ctx); err == nil {
+		t.Fatalf("seat 1 received %q, which was for seat 2", raw)
 	}
 }
 
 func TestFourthJoinerIsTurnedAway(t *testing.T) {
 	c := newClient(t)
-	code := c.open()
+	_, code := c.host("")
 	for range 3 {
-		c.do("POST", "/join", map[string]any{"code": code, "offer": testOffer})
+		c.join("", code)
 	}
-	status, body := c.do("POST", "/join", map[string]any{"code": code, "offer": testOffer})
-	if status != http.StatusConflict {
-		t.Fatalf("status %d", status)
+	p := c.dial("")
+	p.send(map[string]any{"type": "join", "code": code, "offer": testOffer})
+	p.refused("full")
+}
+
+// Before, three arrivals used a room up for good however few were still in it.
+func TestADroppedJoinerFreesItsSeat(t *testing.T) {
+	c := newClient(t)
+	h, code := c.host("")
+	var second *peer
+	for seat := 1; seat <= 3; seat++ {
+		p, _ := c.join("", code)
+		h.expect("offer")
+		if seat == 2 {
+			second = p
+		}
 	}
-	if body["error"] != room.ErrFull.Error() {
-		t.Fatalf("error %v", body["error"])
+
+	second.conn.CloseNow()
+	// the seat comes back when the server notices, which is the next read failing
+	var seat int
+	deadline := time.Now().Add(patience)
+	for {
+		p := c.dial("")
+		p.send(map[string]any{"type": "join", "code": code, "offer": testOffer})
+		msg := p.next()
+		if msg["type"] == "joined" {
+			seat = int(msg["seat"].(float64))
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the seat never came back: %v", msg)
+		}
+		p.conn.CloseNow()
+		time.Sleep(20 * time.Millisecond)
+	}
+	if seat != 2 {
+		t.Fatalf("seat %d, want the freed 2", seat)
 	}
 }
 
-func TestClosingARoomFreesTheCode(t *testing.T) {
+func TestTheRoomGoesWhenTheHostDoes(t *testing.T) {
 	c := newClient(t)
-	code := c.open()
-	c.do("POST", "/close", map[string]any{"code": code})
-	if status, _ := c.do("POST", "/join", map[string]any{"code": code, "offer": testOffer}); status != http.StatusNotFound {
-		t.Fatalf("status %d", status)
+	h, code := c.host("")
+	joiner, _ := c.join("", code)
+	h.expect("offer")
+
+	h.conn.CloseNow()
+	closed := joiner.expect("closed")
+	if closed["reason"] != room.ReasonGone {
+		t.Fatalf("reason %q", closed["reason"])
 	}
+	joiner.hungUp()
+
+	stranger := c.dial("")
+	stranger.send(map[string]any{"type": "join", "code": code, "offer": testOffer})
+	stranger.refused("no_room")
+}
+
+func TestClosingARoomTellsTheJoinersAndFreesTheCode(t *testing.T) {
+	c := newClient(t)
+	h, code := c.host("")
+	joiner, _ := c.join("", code)
+	h.expect("offer")
+
+	h.send(map[string]any{"type": "close"})
+	if closed := joiner.expect("closed"); closed["reason"] != room.ReasonClosed {
+		t.Fatalf("reason %q", closed["reason"])
+	}
+
+	stranger := c.dial("")
+	stranger.send(map[string]any{"type": "join", "code": code, "offer": testOffer})
+	stranger.refused("no_room")
 }
 
 func TestCodesAreCaseInsensitiveAndTrimmed(t *testing.T) {
 	c := newClient(t)
-	messy := "  " + strings.ToLower(c.open()) + " "
-	if status, _ := c.do("POST", "/join", map[string]any{"code": messy, "offer": testOffer}); status != http.StatusOK {
-		t.Fatalf("status %d", status)
+	_, code := c.host("")
+	messy := "  " + strings.ToLower(code) + " "
+	if _, seat := c.join("", messy); seat != 1 {
+		t.Fatalf("seat %d", seat)
 	}
 }
 
-func TestUnknownCodesAndSeatsAre404(t *testing.T) {
+func TestUnknownCodesAndSeatsAreRefused(t *testing.T) {
 	c := newClient(t)
-	if status, _ := c.do("POST", "/join", map[string]any{"code": "ZZZZ", "offer": testOffer}); status != http.StatusNotFound {
-		t.Fatalf("join: %d", status)
-	}
-	if status, _ := c.do("GET", "/offers/ZZZZ", nil); status != http.StatusNotFound {
-		t.Fatalf("offers: %d", status)
-	}
-	if status, _ := c.do("GET", "/answer/ZZZZ/1", nil); status != http.StatusNotFound {
-		t.Fatalf("answer: %d", status)
-	}
-	code := c.open()
-	if status, _ := c.do("POST", "/answer", map[string]any{"code": code, "seat": 9, "answer": testAnswer}); status != http.StatusNotFound {
-		t.Fatal("an answer for an unknown seat should be 404")
-	}
+	p := c.dial("")
+	p.send(map[string]any{"type": "join", "code": "ZZZZ", "offer": testOffer})
+	p.refused("no_room")
+
+	h, _ := c.host("")
+	h.send(map[string]any{"type": "answer", "seat": 9, "answer": testAnswer})
+	h.refused("no_seat")
 }
 
 func TestRubbishIsRejected(t *testing.T) {
 	c := newClient(t)
-	code := c.open()
-	if status, _ := c.do("POST", "/join", map[string]any{"code": code}); status != http.StatusBadRequest {
-		t.Fatal("an offer is required")
-	}
-	if status, _ := c.do("POST", "/join", map[string]any{"code": code, "offer": testAnswer}); status != http.StatusBadRequest {
-		t.Fatal("an answer is not an offer")
-	}
-	c.do("POST", "/join", map[string]any{"code": code, "offer": testOffer})
-	if status, _ := c.do("POST", "/answer", map[string]any{"code": code, "seat": 1, "answer": testOffer}); status != http.StatusBadRequest {
-		t.Fatal("an offer is not an answer")
-	}
+	h, code := c.host("")
+
+	p := c.dial("")
+	p.send(map[string]any{"type": "join", "code": code})
+	p.refused("bad_message") // an offer is required
+	p.send(map[string]any{"type": "join", "code": code, "offer": testAnswer})
+	p.refused("bad_message") // an answer is not an offer
+	p.send(map[string]any{"type": "sing"})
+	p.refused("bad_message")
+
+	c.join("", code)
+	h.expect("offer")
+	h.send(map[string]any{"type": "answer", "seat": 1, "answer": testOffer})
+	h.refused("bad_message") // an offer is not an answer
+}
+
+func TestAConnectionKeepsTheRoleItStartedWith(t *testing.T) {
+	c := newClient(t)
+	h, code := c.host("")
+	h.send(map[string]any{"type": "host"})
+	h.refused("wrong_role")
+
+	joiner, _ := c.join("", code)
+	h.expect("offer")
+	joiner.send(map[string]any{"type": "answer", "seat": 1, "answer": testAnswer})
+	joiner.refused("wrong_role")
+	joiner.send(map[string]any{"type": "close"})
+	joiner.refused("wrong_role")
+	joiner.send(map[string]any{"type": "join", "code": code, "offer": testOffer})
+	joiner.refused("wrong_role")
 }
 
 func TestExpiredRoomIsGone(t *testing.T) {
 	c := newClient(t, func(cfg *api.Config) {
 		cfg.Rooms = room.NewStore(30*time.Millisecond, 500, room.Apps{Default: 3})
 	})
-	code := c.open()
+	_, code := c.host("")
 	time.Sleep(60 * time.Millisecond)
-	if status, _ := c.do("POST", "/join", map[string]any{"code": code, "offer": testOffer}); status != http.StatusNotFound {
-		t.Fatal("an expired room should be gone")
+	p := c.dial("")
+	p.send(map[string]any{"type": "join", "code": code, "offer": testOffer})
+	p.refused("no_room")
+}
+
+func TestICEServersComeBackOverBothRoutes(t *testing.T) {
+	c := newClient(t, func(cfg *api.Config) {
+		cfg.Creds = creds.New("sekrit", time.Hour)
+		cfg.TURN = []string{"turn:turn.example:3478"}
+	})
+	p := c.dial("")
+	p.send(map[string]any{"type": "ice"})
+	overSocket := p.expect("ice_servers")["ice_servers"]
+
+	_, overHTTP := c.get("/ice")
+
+	for where, servers := range map[string]any{"the socket": overSocket, "http": overHTTP["ice_servers"]} {
+		found := false
+		for _, entry := range servers.([]any) {
+			if entry.(map[string]any)["username"] != nil {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s carried no relay credentials", where)
+		}
+	}
+}
+
+func TestICEServersCarryTURNOnlyWhenConfigured(t *testing.T) {
+	plain := newClient(t)
+	_, body := plain.get("/ice")
+	for _, entry := range body["ice_servers"].([]any) {
+		if entry.(map[string]any)["username"] != nil {
+			t.Fatal("no credentials should appear without a secret")
+		}
+	}
+
+	withTURN := newClient(t, func(cfg *api.Config) {
+		cfg.Creds = creds.New("sekrit", time.Hour)
+		cfg.TURN = []string{"turn:turn.example:3478"}
+	})
+	h := withTURN.dial("")
+	h.send(map[string]any{"type": "host"})
+	found := false
+	for _, entry := range h.expect("hosted")["ice_servers"].([]any) {
+		if entry.(map[string]any)["username"] != nil {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("hosting should hand over relay credentials, so it costs no extra round trip")
 	}
 }
 
@@ -248,37 +439,153 @@ func TestOriginAllowlistKeepsOthersOut(t *testing.T) {
 	if blocked.StatusCode != http.StatusForbidden {
 		t.Fatalf("blocked origin: %d", blocked.StatusCode)
 	}
+
+	// and the same allowlist gates the upgrade, which is why the socket does not
+	// check again
+	if conn := c.tryDial("", http.Header{"Origin": {"https://evil.example"}}); conn != nil {
+		t.Fatal("a disallowed origin should not be upgraded")
+	}
+	if conn := c.tryDial("", http.Header{"Origin": {"https://play.example"}}); conn == nil {
+		t.Fatal("an allowed origin should be upgraded")
+	}
 }
 
-func TestICEServersCarryTURNOnlyWhenConfigured(t *testing.T) {
-	plain := newClient(t)
-	_, body := plain.do("GET", "/ice", nil)
-	for _, entry := range body["ice_servers"].([]any) {
-		if entry.(map[string]any)["username"] != nil {
-			t.Fatal("no credentials should appear without a secret")
+func TestHealthCarriesTheBuildVersion(t *testing.T) {
+	c := newClient(t, func(cfg *api.Config) { cfg.Version = "1.2.3" })
+	status, reply := c.get("/health")
+	if status != 200 || reply["version"] != "1.2.3" {
+		t.Fatalf("health: %d %v", status, reply)
+	}
+}
+
+func TestHealthCountsTheOpenRooms(t *testing.T) {
+	c := newClient(t)
+	h, _ := c.host("")
+	if _, reply := c.get("/health"); reply["rooms"] != float64(1) {
+		t.Fatalf("rooms %v, want 1", reply["rooms"])
+	}
+	h.conn.CloseNow()
+
+	deadline := time.Now().Add(patience)
+	for {
+		_, reply := c.get("/health")
+		if reply["rooms"] == float64(0) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the room outlived its host: rooms %v", reply["rooms"])
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestAJoinerInTheWrongAppLooksLikeAStranger(t *testing.T) {
+	c := newClient(t, func(cfg *api.Config) {
+		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Apps{
+			Overrides: map[string]int{"arena": 3, "quiz": 11},
+		})
+	})
+	h := c.dial("?app=arena")
+	h.send(map[string]any{"type": "host"})
+	opened := h.expect("hosted")
+	code := opened["code"].(string)
+	if opened["app"] != "arena" {
+		t.Fatalf("app %v", opened["app"])
+	}
+
+	wrongApp := c.dial("?app=quiz")
+	wrongApp.send(map[string]any{"type": "join", "code": code, "offer": testOffer})
+	wrong := wrongApp.expect("error")
+
+	stranger := c.dial("?app=quiz")
+	stranger.send(map[string]any{"type": "join", "code": "ZZZZ", "offer": testOffer})
+	madeUp := stranger.expect("error")
+
+	if wrong["reason"] != "no_room" || madeUp["reason"] != "no_room" {
+		t.Fatalf("wrong app %v, madeUp code %v, both should be no_room", wrong, madeUp)
+	}
+	if wrong["message"] != madeUp["message"] {
+		t.Fatalf("a wrong app says %q and a madeUp code says %q; they must not be distinguishable",
+			wrong["message"], madeUp["message"])
+	}
+
+	// and the real app can still fill the room from seat 1, so neither attempt cost it
+	// anything
+	for want := 1; want <= 3; want++ {
+		if _, seat := c.join("?app=arena", code); seat != want {
+			t.Fatalf("seat %d, want %d: the failed cross app attempts cost the room a seat", seat, want)
+		}
+	}
+}
+
+func TestMaxJoinersIsReportedPerApp(t *testing.T) {
+	c := newClient(t, func(cfg *api.Config) {
+		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Apps{
+			Overrides: map[string]int{"small": 1, "large": 5},
+		})
+	})
+	for app, want := range map[string]float64{"small": 1, "large": 5} {
+		p := c.dial("?app=" + app)
+		p.send(map[string]any{"type": "host"})
+		if got := p.expect("hosted")["max_joiners"]; got != want {
+			t.Fatalf("%s reported max_joiners %v, want %v", app, got, want)
 		}
 	}
 
-	withTURN := newClient(t, func(cfg *api.Config) {
-		cfg.Creds = creds.New("sekrit", time.Hour)
-		cfg.TURN = []string{"turn:turn.example:3478"}
+	_, code := c.host("?app=small")
+	c.join("?app=small", code)
+	p := c.dial("?app=small")
+	p.send(map[string]any{"type": "join", "code": code, "offer": testOffer})
+	p.refused("full")
+}
+
+func TestAnUnnamedAppStillOpensRoomsAtTheDefault(t *testing.T) {
+	c := newClient(t, func(cfg *api.Config) {
+		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Apps{
+			Default:   3,
+			Overrides: map[string]int{"arena": 11},
+		})
 	})
-	for _, path := range []string{"/ice", "/host"} {
-		method, body := "GET", any(nil)
-		if path == "/host" {
-			method, body = "POST", map[string]any{}
+	for app, want := range map[string]float64{"arena": 11, "typo": 3, "": 3} {
+		query := ""
+		if app != "" {
+			query = "?app=" + app
 		}
-		_, reply := withTURN.do(method, path, body)
-		found := false
-		for _, entry := range reply["ice_servers"].([]any) {
-			if entry.(map[string]any)["username"] != nil {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("%s should carry turn credentials", path)
+		p := c.dial(query)
+		p.send(map[string]any{"type": "host"})
+		if got := p.expect("hosted")["max_joiners"]; got != want {
+			t.Fatalf("%q reported max_joiners %v, want %v", app, got, want)
 		}
 	}
+}
+
+func TestAppKeysAreCheckedBeforeTheyBecomeMapKeys(t *testing.T) {
+	c := newClient(t)
+	for _, bad := range []string{"arena two", "arena/../x", "a@b", strings.Repeat("a", 33)} {
+		if conn := c.tryDial("?app="+url.QueryEscape(bad), nil); conn != nil {
+			t.Fatalf("app %q was upgraded", bad)
+		}
+	}
+	// upper case is a spelling of a valid key, not an invalid one
+	p := c.dial("?app=ARENA")
+	p.send(map[string]any{"type": "host"})
+	if got := p.expect("hosted")["app"]; got != "arena" {
+		t.Fatalf("ARENA should normalize, got %v", got)
+	}
+}
+
+func (c *client) get(path string) (int, map[string]any) {
+	c.t.Helper()
+	res, err := http.Get(c.server.URL + path)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var decoded map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&decoded); err != nil {
+		c.t.Fatalf("decoding GET %s: %v", path, err)
+	}
+	return res.StatusCode, decoded
 }
 
 func (c *client) health(origin string) *http.Response {
@@ -293,124 +600,4 @@ func (c *client) health(origin string) *http.Response {
 		c.t.Fatal(err)
 	}
 	return res
-}
-
-func TestHealthCarriesTheBuildVersion(t *testing.T) {
-	c := newClient(t, func(cfg *api.Config) { cfg.Version = "1.2.3" })
-	status, reply := c.do("GET", "/health", nil)
-	if status != 200 || reply["version"] != "1.2.3" {
-		t.Fatalf("health: %d %v", status, reply)
-	}
-}
-
-// The namespace is a namespace, not a hint: a peer holding a live code for the
-// wrong app is told exactly what a peer holding a made up code is told, and the
-// room it missed is no fuller for the attempt.
-func TestAJoinerInTheWrongAppLooksLikeAStranger(t *testing.T) {
-	c := newClient(t, func(cfg *api.Config) {
-		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Apps{
-			Overrides: map[string]int{"arena": 3, "quiz": 11},
-		})
-	})
-	status, opened := c.do("POST", "/host?app=arena", map[string]any{})
-	if status != http.StatusOK {
-		t.Fatalf("host: %d", status)
-	}
-	code := opened["code"].(string)
-	if opened["app"] != "arena" {
-		t.Fatalf("app %v", opened["app"])
-	}
-
-	wrongApp, wrongBody := c.do("POST", "/join?app=quiz", map[string]any{"code": code, "offer": testOffer})
-	stranger, strangerBody := c.do("POST", "/join?app=quiz", map[string]any{"code": "ZZZZ", "offer": testOffer})
-	if wrongApp != http.StatusNotFound || stranger != http.StatusNotFound {
-		t.Fatalf("wrong app %d, made up code %d, both should be 404", wrongApp, stranger)
-	}
-	if wrongBody["error"] != strangerBody["error"] {
-		t.Fatalf("a wrong app says %q and a made up code says %q; they must not be distinguishable",
-			wrongBody["error"], strangerBody["error"])
-	}
-
-	for _, path := range []string{"/offers/" + code + "?app=quiz", "/answer/" + code + "/1?app=quiz"} {
-		if status, _ := c.do("GET", path, nil); status != http.StatusNotFound {
-			t.Fatalf("GET %s: %d, want 404", path, status)
-		}
-	}
-	if status, _ := c.do("POST", "/answer?app=quiz", map[string]any{"code": code, "seat": 1, "answer": testAnswer}); status != http.StatusNotFound {
-		t.Fatalf("answering into another app: %d", status)
-	}
-	c.do("POST", "/close?app=quiz", map[string]any{"code": code})
-
-	status, joined := c.do("POST", "/join?app=arena", map[string]any{"code": code, "offer": testOffer})
-	if status != http.StatusOK {
-		t.Fatalf("the real app should still be able to join: %d", status)
-	}
-	if seat := int(joined["seat"].(float64)); seat != 1 {
-		t.Fatalf("seat %d: the failed cross app attempts cost the room a seat", seat)
-	}
-}
-
-func TestMaxJoinersIsReportedPerApp(t *testing.T) {
-	c := newClient(t, func(cfg *api.Config) {
-		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Apps{
-			Overrides: map[string]int{"small": 1, "large": 5},
-		})
-	})
-	for app, want := range map[string]float64{"small": 1, "large": 5} {
-		_, opened := c.do("POST", "/host?app="+app, map[string]any{})
-		if opened["max_joiners"] != want {
-			t.Fatalf("%s reported max_joiners %v, want %v", app, opened["max_joiners"], want)
-		}
-	}
-
-	_, opened := c.do("POST", "/host?app=small", map[string]any{})
-	code := opened["code"].(string)
-	c.do("POST", "/join?app=small", map[string]any{"code": code, "offer": testOffer})
-	if status, _ := c.do("POST", "/join?app=small", map[string]any{"code": code, "offer": testOffer}); status != http.StatusConflict {
-		t.Fatalf("a one seat app should turn away a second joiner: %d", status)
-	}
-}
-
-// An app nobody named still opens rooms, at the default cap. This is the property
-// that lets a client written before app keys existed keep working after another app
-// has been given a bigger lobby.
-func TestAnUnnamedAppStillOpensRoomsAtTheDefault(t *testing.T) {
-	c := newClient(t, func(cfg *api.Config) {
-		cfg.Rooms = room.NewStore(15*time.Minute, 500, room.Apps{
-			Default:   3,
-			Overrides: map[string]int{"arena": 11},
-		})
-	})
-	for app, want := range map[string]float64{"arena": 11, "typo": 3, "": 3} {
-		path := "/host"
-		if app != "" {
-			path += "?app=" + app
-		}
-		status, opened := c.do("POST", path, map[string]any{})
-		if status != http.StatusOK {
-			t.Fatalf("host for %q: %d", app, status)
-		}
-		if opened["max_joiners"] != want {
-			t.Fatalf("%q reported max_joiners %v, want %v", app, opened["max_joiners"], want)
-		}
-	}
-}
-
-func TestAppKeysAreCheckedBeforeTheyBecomeMapKeys(t *testing.T) {
-	c := newClient(t)
-	for _, bad := range []string{"arena two", "arena/../x", "a@b", strings.Repeat("a", 33)} {
-		path := "/host?app=" + url.QueryEscape(bad)
-		status, body := c.do("POST", path, map[string]any{})
-		if status != http.StatusBadRequest {
-			t.Fatalf("app %q gave %d, want 400", bad, status)
-		}
-		if body["error"] != "that is not an app" {
-			t.Fatalf("app %q gave error %v", bad, body["error"])
-		}
-	}
-	// upper case is a spelling of a valid key, not an invalid one
-	status, opened := c.do("POST", "/host?app=ARENA", map[string]any{})
-	if status != http.StatusOK || opened["app"] != "arena" {
-		t.Fatalf("ARENA should normalize: %d %v", status, opened["app"])
-	}
 }
